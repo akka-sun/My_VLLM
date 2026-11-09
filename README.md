@@ -8,6 +8,10 @@
 
 # Nano-vLLM
 
+## 项目开发约定
+
+本项目的优化开发仓库为 [akka-sun/My_VLLM](https://github.com/akka-sun/My_VLLM)。开发前请阅读 [项目记忆与协作约定](AGENTS.md)；每次修改的主体代码、作用解释、简单示例和验证结果统一记录在 [改动记录](docs/CHANGELOG.md) 中。完成改动后提交并推送对应版本。
+
 A lightweight vLLM implementation built from scratch.
 
 ## Key Features
