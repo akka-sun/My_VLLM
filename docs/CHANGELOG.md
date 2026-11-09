@@ -40,3 +40,39 @@
 - 提交前检查 Markdown 差异、相对链接目标与必需约定，并执行 `git diff --cached --check`。
 - 提交标题：`docs: establish project memory and change documentation workflow`。
 - 目标仓库：`https://github.com/akka-sun/My_VLLM`；目标分支：`main`。
+
+## 2026-11-09：增加流式 token 输出
+
+### 需求与主体修改
+
+- `nanovllm/engine/llm_engine.py` 的 `step(stream=True)` 在每轮返回新增 token 和结束标志；默认调用仍只返回已完成请求。
+- 新增 `generate_stream()` 迭代接口，返回请求 ID、新增 token、累计文本和结束标志。README 增加使用方式。
+- `tests/test_streaming.py` 使用真实调度器测试增量输出；测试环境仅替换依赖 CUDA 模型栈的 ModelRunner。
+
+### 核心代码解释与示例
+
+```python
+previous_lengths = [seq.num_completion_tokens for seq in seqs]
+# 在模型运行和 scheduler.postprocess 后：
+delta = seq.completion_token_ids[previous_length:]
+```
+
+记录本轮生成前的长度，再截取新增部分。例如已有 `[7]`，本轮追加 `9`，只返回 `[9]`。分块预填充若没有追加 token，则不产生输出；结束时仍返回最后一个 token，包括 EOS。
+
+```python
+token_ids = completions.setdefault(output["seq_id"], [])
+token_ids.extend(output["token_ids"])
+yield {**output, "text": self.tokenizer.decode(token_ids)}
+```
+
+按请求分别累计 token，随每次 `step()` 返回立即交给调用者。例如两个请求同时生成 `A`，会各产生一个事件；下一轮各返回新增 `!`，累计文本为 `A!`。文本采用累计解码，避免独立解码半个多字节字符；调用者应替换显示文本，不能把累计文本直接拼接。
+
+流式迭代要求引擎空闲，参数列表长度必须匹配提示数量。提前停止迭代不会取消剩余请求，需继续调用 `step()` 完成；README 和方法说明均注明此行为。
+
+### 验证与版本信息
+
+- 先运行新增测试，旧实现出现 4 个预期失败（缺少流式接口），1 个兼容性测试通过；实现后 `python -m pytest -q`：5 passed。
+- 覆盖首 token 立即返回、EOS 仅输出一次、分块预填充、多请求增量输出、原 `generate()` 行为和参数长度校验。
+- 测试产生 2 条现有环境中 botocore 的弃用警告。
+- Windows 环境为 PyTorch 2.3.1+cu118、RTX 3060 Laptop，缺少 Triton / FlashAttention，且低于项目要求的 PyTorch 2.4；未执行真实模型端到端推理，无吞吐提升声明，也未下载权重。
+- 提交标题：`feat: add incremental token streaming`；目标分支：`main`。

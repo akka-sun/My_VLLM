@@ -46,23 +46,59 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
-    def step(self):
+    def step(self, stream: bool = False):
         seqs, is_prefill = self.scheduler.schedule()
+        previous_lengths = [seq.num_completion_tokens for seq in seqs] if stream else []
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        if stream:
+            outputs = [
+                {"seq_id": seq.seq_id, "token_ids": seq.completion_token_ids[previous_length:],
+                 "finished": seq.is_finished}
+                for seq, previous_length in zip(seqs, previous_lengths)
+                if seq.num_completion_tokens > previous_length
+            ]
+        else:
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    def generate_stream(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+    ):
+        """Yield token deltas and cumulative text after each step.
+
+        Exhaust the iterator before starting another generation on this engine.
+        Closing it early leaves pending requests queued for subsequent steps.
+        Cumulative text may revise its suffix as the tokenizer resolves bytes.
+        """
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        if len(sampling_params) != len(prompts):
+            raise ValueError("sampling_params must match the number of prompts")
+        if not self.is_finished():
+            raise ValueError("generate_stream requires an engine with no pending requests")
+        for prompt, sp in zip(prompts, sampling_params):
+            self.add_request(prompt, sp)
+        completions = {}
+        while not self.is_finished():
+            outputs, _ = self.step(stream=True)
+            for output in outputs:
+                token_ids = completions.setdefault(output["seq_id"], [])
+                token_ids.extend(output["token_ids"])
+                yield {**output, "text": self.tokenizer.decode(token_ids)}
 
     def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+    ) -> list[dict]:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)

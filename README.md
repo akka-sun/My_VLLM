@@ -47,6 +47,25 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Streaming output
+
+```python
+for chunk in llm.generate_stream(["Hello, Nano-vLLM."], sampling_params):
+    # text is the cumulative completion; token_ids contains only this step's new tokens.
+    print(chunk["seq_id"], repr(chunk["text"]), chunk["finished"], flush=True)
+```
+
+For manual scheduling, call `add_request()` and then `step(stream=True)` until
+`is_finished()`. It returns `(chunks, num_tokens)`; each chunk contains `seq_id`,
+incremental `token_ids`, and `finished`. Intermediate chunked-prefill steps may
+return no chunks. EOS is included in the final token delta. Default `step()` and
+`generate()` keep their existing complete-result behavior.
+
+`generate_stream()` requires an idle engine. Consume the iterator fully before
+starting another generation; stopping early leaves requests queued. Its `text`
+is decoded from all completion tokens so multibyte token fragments can be
+resolved; replace the displayed text with this value instead of concatenating it.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
