@@ -47,6 +47,22 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Top-k / Top-p sampling
+
+Sampling filters can be configured per request:
+
+```python
+sampling_params = SamplingParams(temperature=0.6, top_k=50, top_p=0.9, max_tokens=256)
+outputs = llm.generate(prompts, sampling_params)
+# A list of SamplingParams also supports different filters in the same batch.
+```
+
+`top_k=0` disables Top-k; positive integers keep at most k candidates (capped by
+the vocabulary size). `top_p` must be in `(0, 1]`; `1.0` disables nucleus
+filtering. Filters apply after temperature scaling, in Top-k then Top-p order.
+Top-p keeps the shortest sorted prefix reaching p, including the crossing token;
+at least one candidate always remains. Defaults preserve unfiltered sampling.
+
 ## Streaming output
 
 ```python

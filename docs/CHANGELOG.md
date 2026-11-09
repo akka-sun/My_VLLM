@@ -76,3 +76,72 @@ yield {**output, "text": self.tokenizer.decode(token_ids)}
 - 测试产生 2 条现有环境中 botocore 的弃用警告。
 - Windows 环境为 PyTorch 2.3.1+cu118、RTX 3060 Laptop，缺少 Triton / FlashAttention，且低于项目要求的 PyTorch 2.4；未执行真实模型端到端推理，无吞吐提升声明，也未下载权重。
 - 提交标题：`feat: add incremental token streaming`；目标分支：`main`。
+
+## 2026-11-09：增加按请求配置的 Top-k / Top-p 采样
+
+### 需求与主体修改
+
+- `nanovllm/sampling_params.py`：新增 `top_k=0`、`top_p=1.0` 及范围校验。
+- `nanovllm/engine/sequence.py`：在主进程序列中保存两个参数。
+- `nanovllm/engine/model_runner.py`：`prepare_sample()` 按当前调度顺序构造 GPU 参数，`run()` 将其传给 Sampler。采样只在 rank 0 执行，因此其他张量并行进程不需要序列化这些参数。
+- `nanovllm/layers/sampler.py`：温度缩放后执行 Top-k、Top-p，再沿用指数噪声采样。
+- `tests/test_sampling.py`：新增参数、候选集合、概率、CUDA 参数传递和计算图测试；README 增加配置示例。
+
+### 核心代码解释与示例
+
+**参数与请求传递**
+
+```python
+top_k: int = 0
+top_p: float = 1.0
+# ModelRunner.prepare_sample（示意）：
+top_ks = [seq.top_k for seq in seqs]
+top_ps = [seq.top_p for seq in seqs]
+```
+
+每个请求有自己的过滤参数。例如同一批请求可以分别用 `top_k=1` 和 `top_p=0.9`。`top_k` 必须为非负整数，0 关闭；`top_p` 必须在 `(0, 1]`，1 关闭。整批未启用的过滤器传 `None`，默认配置直接走原来的无排序采样路径。
+
+**Top-k 过滤**
+
+```python
+sorted_logits, indices = logits.sort(dim=-1, descending=True)
+remove = (top_ks.unsqueeze(1) > 0) & (ranks >= top_ks.unsqueeze(1))
+sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+```
+
+按概率顺序只保留前 k 个候选，过滤后的负无穷在 softmax 中变成零概率。例如原概率 `[0.6, 0.3, 0.1]`、k=2，仅前两个候选保留；归一化后约为 `[0.667, 0.333, 0]`。并列分数也只保留 k 个候选，但并列 token 的取舍不保证稳定；k 大于词表大小相当于保留全部候选。
+
+**Top-p 最短概率前缀**
+
+```python
+sorted_probs = sorted_logits.softmax(dim=-1)
+cumulative = sorted_probs.cumsum(dim=-1)
+previous = torch.cat((torch.zeros_like(cumulative[:, :1]), cumulative[:, :-1]), dim=-1)
+remove = (previous >= top_ps.unsqueeze(1)) & (top_ps.unsqueeze(1) < 1)
+remove[:, 0] = False
+```
+
+保留累计概率首次达到或超过 p 的最短前缀。例如概率 `[0.6, 0.3, 0.1]`、p=0.7 时保留前两个，第二个是跨过阈值的 token；p=0.6 时只需第一个。若先应用 k=2，再取 p=0.6，Top-k 归一化后第一个概率约 0.667，因此只保留第一个。极小的 p 转为 float32 后可能下溢为 0，强制保留第一名避免产生空分布。
+
+**映射回词表并采样**
+
+```python
+logits = torch.empty_like(logits).scatter_(1, indices, sorted_logits)
+probs = torch.softmax(logits, dim=-1)
+sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+```
+
+把候选分数恢复到原 token ID 的位置，再沿用原来的随机采样方式。例如排序第一名原本是 token 42，最终返回的仍是 42，而非排序名次 0。温度缩放改为非原地运算，避免输入已为 float32 时意外修改调用者的 logits。
+
+### 验证与版本信息
+
+- 实现前新增采样测试出现 12 个预期失败（缺少参数或接口）；实现后全套测试最终为 `21 passed, 2 warnings`。
+- 执行方式：PowerShell 中设置 `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'` 和 `$env:USE_TF='0'` 后运行 `python -m pytest -q`。
+- CPU 与 RTX 3060 Laptop GPU 均验证混合批次的候选范围；验证 Top-p 跨阈值 token、恰好到达阈值、Top-k 并列/超过词表、非法参数、默认行为与输入不变性。
+- 使用真实 `ModelRunner.prepare_sample()` 测试参数传到 CUDA，调用实际 `run()` 连接逻辑；仅模型执行由固定 logits 替代。
+- 极小 p 的新增回归测试先复现错误，再通过第一名保留保护修复。
+- 独立代码审查发现超大 `top_k` 转为 int64 时溢出的边界；增加回归覆盖并在传输前限制到 int64 最大值，仍保持超过词表大小时保留全部候选的语义。
+- `torch.compile(..., backend="eager", fullgraph=True)` 在独立子进程中通过。隔离原因：本机旧 Transformers 的 `file_utils.ModelOutput` 缺失会触发 PyTorch 2.3 Dynamo 类型检查错误；未验证生产 Inductor/Triton 编译。
+- `python -m compileall -q nanovllm tests` 通过。2 条警告来自环境中的 botocore 弃用 API。
+- 受第一项记录中的 Windows/CUDA 依赖限制，未下载权重或运行真实模型端到端推理。启用过滤需排序，可能增加耗时；未实测性能，不声明提速。
+- 提交标题：`feat: support per-request top-k and top-p sampling`；目标分支：`main`。
