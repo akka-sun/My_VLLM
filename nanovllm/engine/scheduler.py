@@ -22,6 +22,17 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def abort(self, seq_id: int) -> bool:
+        for queue in (self.waiting, self.running):
+            for seq in queue:
+                if seq.seq_id == seq_id:
+                    queue.remove(seq)
+                    self.block_manager.deallocate(seq)
+                    seq.num_scheduled_tokens = 0
+                    seq.status = SequenceStatus.FINISHED
+                    return True
+        return False
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         """Decode first, then fill the remaining budget with prompt chunks.
 

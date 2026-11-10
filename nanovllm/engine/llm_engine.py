@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -35,16 +36,39 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            return
         del self.model_runner
-        for p in self.ps:
-            p.join()
+        atexit.unregister(self.exit)
+        try:
+            runner.call("exit")
+        finally:
+            for p in self.ps:
+                p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if not prompt or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in prompt):
+            raise ValueError("prompt must contain non-negative integer token IDs")
+        if hasattr(self.tokenizer, "__len__") and any(t >= len(self.tokenizer) for t in prompt):
+            raise ValueError("prompt contains an out-of-vocabulary token ID")
+        if isinstance(sampling_params.max_tokens, bool) or not isinstance(sampling_params.max_tokens, int) or sampling_params.max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        config = getattr(self, "config", None)
+        if config is not None and len(prompt) + sampling_params.max_tokens > config.max_model_len:
+            raise ValueError("prompt plus max_tokens exceeds max_model_len")
+        capacity = len(self.scheduler.block_manager.blocks) * self.scheduler.block_size
+        if len(prompt) + sampling_params.max_tokens - 1 > capacity:
+            raise ValueError("request exceeds total KV cache capacity")
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def abort_request(self, seq_id: int) -> bool:
+        """Remove a queued/active request and release its KV cache pages."""
+        return self.scheduler.abort(seq_id)
 
     def step(self, stream: bool = False):
         seqs, is_prefill = self.scheduler.schedule()

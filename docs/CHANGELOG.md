@@ -250,3 +250,94 @@ self.register_buffer("weight_scale", torch.ones(out, 1, dtype=torch.float32))
 - 独立审查未发现明确的严重正确性问题，建议扩大测试。已补充非等量 Q/KV 的 GQA、不同通道行值、两个 TP 本地结果相加、真实 Qwen 构造器的量化传递与 embedding/head 绑定检查（仅替换不可用的 GPU 模块）。量化专项最终 9 passed / 6 skipped；GPU 参数包括 FP16/BF16、M=1 decode、M=33 多 tile、K=2048，以及更改输入后的 Graph replay。
 - 最终全套测试为 36 passed / 9 skipped；`compileall`、`git diff --check` 通过。真实跨进程 NCCL collective 和 Qwen checkpoint 端到端推理仍未验证。
 - 提交标题：`feat: add W8A16 int8 weight quantization`；目标分支：`main`。
+
+## 2026-11-10：增加 OpenAI 兼容异步 API 与 SSE 服务
+
+### 需求、方案与主体修改
+
+以 FastAPI 包装 LLMEngine，提供 `/v1/completions`、`/v1/chat/completions`，支持并发异步调用和逐 token SSE。采用单个后台线程统一拥有引擎及 tokenizer，由异步命令队列接收请求；没有为每个 HTTP 请求分别调用离线 `generate_stream()`，因为后者要求引擎空闲，不能安全地共享调度状态。
+
+- `nanovllm/server/async_engine.py`：`AsyncLLMEngine` 管理单线程 executor、有限命令/事件队列、请求准入、混合调度、增量文本、取消、错误广播与关闭。
+- `nanovllm/server/app.py`：`create_app()` 和 lifespan 管理引擎；两个生成接口支持 JSON/SSE；补充 `/v1/models`、`/health`、错误处理和响应生命周期清理。
+- `nanovllm/server/schemas.py`、`errors.py`：显式验证文本接口子集，使用 OpenAI 风格错误对象。
+- `nanovllm/server/__main__.py`：命令行启动，支持 Chunked Prefill 预算、TP、W8A16；固定单 HTTP worker。
+- `nanovllm/engine/llm_engine.py`：`add_request()` 返回 sequence ID，验证 token/context/KV 容量；增加 `abort_request()`，`exit()` 可重复调用。
+- `nanovllm/engine/scheduler.py`：`abort()` 从等待/运行队列移除请求并释放 KV。
+- `nanovllm/__init__.py`：延迟导入 LLM，避免查看服务帮助时提前加载 CUDA 栈。
+- `pyproject.toml`：server/test 可选依赖、`nanovllm-serve` 入口、pytest 测试目录；`tests/test_api.py` 和 README 提供验证与用法。
+
+### 核心逻辑、解释与示例
+
+**单线程所有权与连续批处理**
+
+```python
+self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nanovllm-engine')
+seq_id, count = await self.call(self._add, *payload)
+outputs, _ = await self.call(self.engine.step, stream=True)
+```
+
+初始化、tokenizer、add/step/abort/exit 都在同一线程执行，HTTP 事件循环仅等待计算结果。例如 A 正在 decode、B 新提交长 prompt，B 在下一轮开始前进入同一调度器，复用第一项实现的混合批次，不创建第二个模型或并发修改 Scheduler。每轮最多消费 64 条命令后推进计算，避免准入命令持续淹没推理。
+
+**首包实时性与文本增量**
+
+```python
+handle.token_ids.extend(output['token_ids'])
+text = await self.decode(handle.token_ids)  # 必须在下一轮 GPU step 前完成
+handle.queue.put_nowait({**output, 'text': text})
+```
+
+例如第一轮生成 A、第二轮 GPU 推理耗时很长，客户端仍应立即收到 A。若把 decode 留在 HTTP handler 中，它可能排在第二轮推理之后，违背流式语义；真实 TCP 测试复现该阻塞后，已按上面的顺序修复。文本使用累计解码，HTTP 只发送新增后缀；中间的 UTF-8 替换字符暂缓发送。例如第一个 token 解码 `�`、第二个补全为 `你`，客户端最终只收到 `你`。关闭 tokenizer 的空格清理；若 tokenizer 仍修改已经发送的前缀，返回明确流错误而非静默拼错文本。
+
+**OpenAI JSON/SSE 协议与使用量**
+
+```text
+data: {"object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"A"},"finish_reason":null}]}
+data: ... finish_reason="stop" / "length" ...
+data: [DONE]
+```
+
+chat 使用 tokenizer 自带的 `apply_chat_template(..., tokenize=True, add_generation_prompt=True)`；普通 completion 使用原始文本或一条 token-ID 列表。例如输入 2 tokens、生成 A 和 EOS 共 2 tokens，usage 为 `{prompt_tokens:2, completion_tokens:2, total_tokens:4}`，显示文本不包含 EOS。`stream_options.include_usage=true` 时，在 `[DONE]` 前追加 `choices=[]` 的 usage 片段；响应 ID 与 created 在整个流中不变。参考：[OpenAI streaming events](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)、[FastAPI 生命周期](https://fastapi.tiangolo.com/advanced/events/)。
+
+**输入验证与兼容边界**
+
+```python
+greedy = body.temperature <= 1e-10
+params = SamplingParams(temperature=1.0 if greedy else body.temperature,
+    top_k=1 if greedy else body.top_k, ...)
+```
+
+温度 0 或极小正数转换为 top-1，不触发原 SamplingParams 的正温度断言。普通文本/整数 token 输入、文本 chat、n=1、max_tokens、temperature、top_p、top_k 和 stream 是支持的子集；批量 prompt、多模态、tools、非空 stop、logprobs、penalties 等未实现字段返回 400。未知模型返回 404；超出 context/KV 或非法 token 返回 400；超载/失效服务返回 503。完整接口规范中的其他能力未声称支持。
+
+```python
+if len(prompt) + max_tokens > config.max_model_len:
+    raise ValueError(...)
+if len(prompt) + max_tokens - 1 > total_kv_capacity:
+    raise ValueError(...)
+```
+
+例如上下文上限 32，prompt 长 32、max_tokens=1 被拒绝；单条请求也不能大于总 KV 容量，以免调度器无限抢占或在 GPU 中越界。最后一个输出 token 不再送入模型，因此 KV 上限计算减 1。请求 ID 使 API 能精确取消某条请求，原离线返回内容保持兼容。
+
+**断连、背压、异常与关闭**
+
+```python
+class CancellableStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.cleanup()
+```
+
+例如客户端在长 prompt 的第一个输出之前断开，甚至发送响应头就抛 OSError，也会取消该请求并回收页；仅在流生成器写 finally 不够，因为生成器可能尚未启动。取消等当前正在执行的 GPU step 返回后生效，不能中断已提交内核。已经部分输出后断连不返回“成功完成”的 usage。每请求事件缓冲默认 128、活动请求默认 256，慢消费者被取消；模型异常会给活动请求结构化错误并将服务标为失效，后续请求返回 503，细节只记入服务日志。关闭时终止剩余请求并释放引擎，重复 exit/close 安全。
+
+### 验证与版本信息
+
+- API 第一轮新增测试为 4 failed；实现基础路径后为 4 passed。后续真实 HTTP 和响应头失败测试分别复现首 token 被下一轮推理阻塞、尚未进入流生成器时的取消泄漏；修复后全部通过。审查另发现 `temperature=1e-12` 触发断言，回归测试先失败，再通过 near-zero greedy 转换修复。
+- API 专项最终 10 passed：真实 Scheduler/BlockManager + 确定性模型执行，检查 engine/tokenizer 线程所有权、并发混合批次、queued/partial cancellation、KV 回收、早期取消准入、慢消费者、关闭、EOS/length、usage、UTF-8 分片、普通/流式错误、未知模型/非法字段/context。
+- 使用真实 Uvicorn TCP 服务验证首个 SSE A 在阻塞第二轮 decode 时到达，阻塞期间 `/health` 仍响应；随后断开客户端，确认未生成到 max_tokens 就取消，线程/引擎关闭。服务只存在于测试期间，没有留下常驻服务器。
+- 使用已安装的 OpenAI Python SDK 通过本地 ASGI transport 验证 completion JSON 和 chat SSE/usage 可解析；`python -m nanovllm.server --help` 在缺少 CUDA/Triton 的环境中通过。
+- 测试中的模型执行为可控替代；没有模型权重或真实 GPU HTTP 端到端推理，性能/精度仍未测量。真实 GPU 内核测试保持明确 skip。
+- 最终 `python -m pytest -q`：46 passed / 9 skipped；`python -m compileall -q nanovllm tests`、`git diff --check` 通过。验证环境为 Python 3.12、CPU PyTorch 2.15、Transformers 5.22、FastAPI 0.162，OpenAI SDK 3.48；未覆盖所有依赖最低版本组合。
+- 提交标题：`feat: serve OpenAI-compatible async completions API`；目标分支：`main`。

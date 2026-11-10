@@ -116,6 +116,76 @@ INT8 linear storage is about one byte per weight plus four bytes per output
 channel; total model memory savings vary. Accuracy and speed depend on the
 model and hardware, and must be measured before drawing conclusions.
 
+## OpenAI-compatible API server
+
+Install the optional HTTP dependencies in the same Linux/CUDA environment used
+for model inference, then start one server process:
+
+```bash
+pip install ".[server]"
+python -m nanovllm.server --model /YOUR/MODEL/PATH \
+  --served-model-name nano-vllm --port 8000 \
+  --max-num-batched-tokens 512 --max-num-seqs 32
+# Optional: --quantization int8 --enforce-eager --tensor-parallel-size 2
+# The installed entry point is also available: nanovllm-serve --help
+```
+
+The default host is `127.0.0.1`. One background thread owns model initialization,
+tokenization, scheduling, and execution; concurrent HTTP requests enter the same
+continuous batch. Use a single Uvicorn HTTP worker (the CLI sets this); tensor
+parallelism is controlled by `--tensor-parallel-size`.
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nano-vllm","prompt":"Hello","max_tokens":32}'
+
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nano-vllm","messages":[{"role":"user","content":"Hello"}],"max_tokens":32,"stream":true,"stream_options":{"include_usage":true}}'
+```
+
+OpenAI Python clients can point at the local server:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+for chunk in client.chat.completions.create(
+    model="nano-vllm", messages=[{"role": "user", "content": "你好"}],
+    max_tokens=64, stream=True,
+):
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+Both endpoints support nonstreaming JSON and incremental SSE terminated by
+`data: [DONE]`. Chat uses the model tokenizer's chat template. Responses include
+`stop`/`length` finish reasons and token usage; streaming usage is opt-in via
+`stream_options.include_usage`. EOS/special tokens are excluded from displayed
+text but generated tokens including EOS count toward usage. Decode runs before
+the next GPU step, so an already-produced token is not held behind that step.
+`GET /v1/models` lists the served name; `GET /health` reports worker health.
+
+This is a text-only compatibility subset: one string or one token-ID list for
+completions, text chat messages, `n=1`, `max_tokens` (default 16), `temperature`
+(0–2), `top_p`, and the `top_k` extension. Temperatures at or below `1e-10`
+select greedy top-1. Batched prompts, tools, multimodal input, custom stop
+strings, logprobs, penalties, and other unknown fields return an explicit 400
+instead of being silently ignored. Prompt plus `max_tokens` must fit the model
+context and KV capacity. Invalid fields/context return OpenAI-shaped 400 errors,
+unknown models 404, overload/unavailable service 503, and execution failures 500
+(or an error SSE event after headers have been sent).
+
+Disconnects cancel queued/active requests and reclaim KV pages after any current
+model step completes. Request admission and event buffers are bounded; slow
+consumers are cancelled. Shutdown aborts pending requests and closes the engine.
+The original offline `generate()` and `generate_stream()` remain available.
+
+For CPU logic/HTTP tests, install the test extra in a suitable environment and
+run `python -m pytest -q`. GPU kernel tests skip when CUDA/Triton/FlashAttention
+are unavailable. The HTTP tests use the real engine scheduler with deterministic
+model execution; they do not establish real model performance or quality.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
