@@ -99,6 +99,23 @@ If decode fills every token/sequence slot, waiting prompts resume when slots
 become available. No throughput or latency improvement is claimed without a
 measurement on the target GPU/model.
 
+## INT8 weight-only quantization (W8A16)
+
+```python
+llm = LLM("/YOUR/MODEL/PATH", quantization="int8")
+```
+
+Load a regular FP16/BF16 safetensors checkpoint. Attention/MLP linear weights
+are symmetrically quantized per output channel after tensor-parallel sharding:
+INT8 values plus FP32 scales. CUDA matmul dequantizes tiles inside a Triton
+kernel, keeping activations and outputs in FP16/BF16 and accumulating in FP32.
+Embedding, LM head, norms, biases, and KV cache keep their floating dtype; tied
+embedding/head weights stay tied. `quantization=None` preserves the default.
+This is W8A16, not W8A8, GPTQ, AWQ, or a loader for pre-quantized checkpoints.
+INT8 linear storage is about one byte per weight plus four bytes per output
+channel; total model memory savings vary. Accuracy and speed depend on the
+model and hardware, and must be measured before drawing conclusions.
+
 ## Benchmark
 
 See `bench.py` for benchmark.

@@ -198,3 +198,55 @@ KV 先按物理 slot 写入 cache，再通过 block table 读取完整逻辑前�
 - 独立审查复现“部分 prompt 占用全部 KV、decode 自抢占后无法重新分配”的崩溃。新增测试先复现 `AssertionError`，再通过优先回收等待中的部分 prompt 页修复；该 prompt 稍后重新计算，已生成 token 不丢失。全套 CPU 测试最终为 27 passed / 3 skipped（包括新增可选真实 GPU Attention 测试）。`compileall` 和 `git diff --check` 通过。
 - 本机验证环境使用 CPU PyTorch，无 Triton/FlashAttention，未运行真实模型推理、CUDA Graph 或多 GPU 端到端测试；不下载模型权重，不声称吞吐或延迟提升。KV 仍为整条请求预留，长 prompt 必须能放入总 KV 容量。
 - 提交标题：`feat: interleave chunked prefill with decode`；目标分支：`main`。
+
+## 2026-11-10：增加 INT8 权重量化 W8A16
+
+### 需求、方案与主体修改
+
+用户允许 W8A16 或 W8A8，本次采用已确认的 W8A16：线性权重 INT8，激活与输出 FP16/BF16，累加 FP32。选择权重量化以避免引入激活校准和请求级激活量化；CUDA 使用 Triton tile 内解量化，不在每次 forward 构造完整浮点权重副本。
+
+- `nanovllm/config.py`：增加 `quantization=None | "int8"`，检查模式和量化模型的 16 位 dtype。
+- `nanovllm/models/qwen3.py`、`engine/model_runner.py`：将配置传入 Attention/MLP 的 QKV、输出、gate/up 和 down 线性层，构造时直接分配 INT8 权重。
+- `nanovllm/layers/linear.py`：在原分片加载路径后量化，保存输出通道对应的 scale；保留 RowParallel 的 bias/all-reduce 语义。
+- `nanovllm/layers/quantization.py`：量化数学与 CPU 正确性参考；`quantization_triton.py`：CUDA 融合解量化矩阵乘。
+- `nanovllm/utils/loader.py`：沿用 safetensors 和 packed weight 回调，缺少 checkpoint 时明确报错；`tests/test_quantization.py` 与 README 覆盖用法和验证。
+
+### 核心逻辑、解释与示例
+
+```python
+maximum = weight.float().abs().amax(dim=1, keepdim=True)
+scale = torch.where(maximum > 0, maximum / 127, torch.ones_like(maximum))
+quantized = (weight.float() / scale).round().clamp(-127, 127).to(torch.int8)
+```
+
+每行对应一个输出通道，scale 为 FP32。例如 `[0, 1, -2]` 的 scale 约为 0.015748，INT8 为 `[0, 64, -127]`，重建约为 `[0, 1.0079, -2]`。全零行使用 scale=1，避免除零。仅支持普通浮点 checkpoint，不把预量化整数权重当作浮点权重解释。
+
+```python
+loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+self._copy_weight(param_data, loaded_weight, shard_offset)
+```
+
+先分片，再按本地行量化。QKV 和 gate/up 需要把 scale 放到对应输出片段。例如两 rank 的 gate/up 总输出 `[4, 2]`，每 rank 本地输出分别为 gate 的 2 行与 up 的 1 行，up scale 从本地偏移 2 开始；不能覆盖 gate 的 scale。RowParallel 按输入列切片，各 rank 有自己的局部 scale，完成局部矩阵乘后仍求和，bias 仅 rank 0 添加。
+
+```python
+w = (w.to(tl.float32) * scales[None, :]).to(x.dtype)
+acc += tl.dot(x, w)
+```
+
+CUDA 仅重建当前矩阵 tile，在 FP32 中累加并转回激活 dtype。例如 K=80 时分三个 K=32 的 tile，最后 16 个有效元素之外使用 mask=0；不会读取越界权重。CPU 路径显式恢复浮点矩阵供测试参考，生产 CUDA 不走该分支。CUDA Graph 路径不进行 CPU 同步或加载主机权重。
+
+```python
+self.weight = nn.Parameter(torch.empty(out, inp, dtype=torch.int8), requires_grad=False)
+self.register_buffer("weight_scale", torch.ones(out, 1, dtype=torch.float32))
+```
+
+例如 16×64 的线性权重，FP16 存储 2048 字节，INT8+scale 为 1024+64=1088 字节；这仅是该矩阵的存储计算，不是整模型实测。Embedding、LM head、norm、bias 与 KV Cache 保持浮点，绑定 embedding/head 不改变。
+
+### 验证与版本信息
+
+- 实现前新增测试为 7 failed / 1 GPU skipped；实现后量化专项为 7 passed / 1 skipped。
+- 使用真实 safetensors 临时文件验证 packed 权重及 bias 加载；CPU 验证 FP16/BF16 的平均绝对误差小于测试阈值 0.07、零行有限、实际 INT8 存储、TP 本地分片和 scale 偏移、rank 1 不重复加 bias、非法模式和缺失 checkpoint。
+- 提供真实 Triton CUDA 数值/CUDA Graph 测试，覆盖非整 tile 尺寸，当前 CPU 验证环境明确跳过。未进行真实模型精度、困惑度、吞吐、延迟或显存峰值测试，不宣称量化提速或整模型节省比例。
+- 独立审查未发现明确的严重正确性问题，建议扩大测试。已补充非等量 Q/KV 的 GQA、不同通道行值、两个 TP 本地结果相加、真实 Qwen 构造器的量化传递与 embedding/head 绑定检查（仅替换不可用的 GPU 模块）。量化专项最终 9 passed / 6 skipped；GPU 参数包括 FP16/BF16、M=1 decode、M=33 多 tile、K=2048，以及更改输入后的 Graph replay。
+- 最终全套测试为 36 passed / 9 skipped；`compileall`、`git diff --check` 通过。真实跨进程 NCCL collective 和 Qwen checkpoint 端到端推理仍未验证。
+- 提交标题：`feat: add W8A16 int8 weight quantization`；目标分支：`main`。
