@@ -145,3 +145,56 @@ sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e
 - `python -m compileall -q nanovllm tests` 通过。2 条警告来自环境中的 botocore 弃用 API。
 - 受第一项记录中的 Windows/CUDA 依赖限制，未下载权重或运行真实模型端到端推理。启用过滤需排序，可能增加耗时；未实测性能，不声明提速。
 - 提交标题：`feat: support per-request top-k and top-p sampling`；目标分支：`main`。
+
+## 2026-11-10：Chunked Prefill 与 Decode 混合调度
+
+### 需求、方案与主体修改
+
+现有实现已经支持单个 prompt 分块，但等待队列总是优先于 decode，长 prompt 会阻塞已开始生成的请求。本次采用用户确认的混合批次方案：先为 decode 分配预算，再用剩余预算处理一个或多个 prefill chunk。没有采用仅在两个独立批次间轮换的方案，因为混合批次能复用已有变长 Attention 和剩余预算。
+
+- `nanovllm/engine/scheduler.py`：重写 `schedule()` 的批次组装顺序；decode 同样受 token 和序列数上限限制，剩余空间可容纳多个部分 prompt。`postprocess()` 根据每条序列实际缓存进度决定是否追加输出。
+- `nanovllm/engine/model_runner.py`：`prepare_prefill()` 同时准备 prompt chunk 和 decode 单 token，兼容张量并行 worker 中只有 `last_token` 的 decode 序列。
+- `nanovllm/layers/attention.py`：明确混合批次的 paged K/V 与右下角对齐因果掩码约定；无需引入第二套 Attention 内核。
+- `tests/test_chunked_prefill.py`：覆盖交错执行、两个预算、多个部分 prompt、前缀复用、抢占恢复、张量并行输入、分块 Attention 数值。
+- `tests/test_attention_cuda.py`：提供使用真实 Triton/FlashAttention 的可选 GPU 数值集成测试；依赖不满足时明确跳过。
+- `README.md`：补充配置方式、调度行为和 KV 容量边界。
+
+### 核心逻辑、解释与示例
+
+```python
+seq.num_scheduled_tokens = 1  # 先调度 decode
+remaining = self.max_num_batched_tokens - num_batched_tokens
+seq.num_scheduled_tokens = min(num_tokens, remaining)  # 再填 prompt chunk
+```
+
+同一轮先保障正在生成的请求，再按剩余预算推进等待请求。例如预算 4，有一个 decode 和长度 8 的新 prompt，则本轮执行 1 个 decode token 与 3 个 prompt token；后续轮次继续交错，直到最后一个 chunk 才输出 prompt 的第一个生成 token。序列槽位满或 decode 用完预算时，prefill 等待空位，不保证无界请求流下的抢占公平性。
+
+```python
+if seq.num_cached_tokens < seq.num_tokens:
+    continue
+seq.append_token(token_id)
+```
+
+是否产生输出由每条序列决定，与整批选择的 Attention 路径分开。例如同一批中一个 decode 立即追加输出，另一个 prompt 仅完成第 3/8 个 token，后者不追加模型为中间 chunk 计算的候选 token。纯 decode 仍使用原 CUDA Graph 路径，混合批次使用变长路径。
+
+```python
+input_ids.extend(seq[start:end] if seq.token_ids else [seq.last_token])
+```
+
+主进程保存完整 token 序列，decode worker 的序列化状态仅保留最后一个 token。例如 decode 已缓存 2 个 token、最后 token 为 7，新 prompt 本轮位置为 2、3，则混合输入为 `[7, prompt[2], prompt[3]]`，位置为 `[2, 2, 3]`，每条请求的 K 长度仍包含缓存前缀。
+
+```python
+if context.block_tables is not None:
+    k, v = k_cache, v_cache
+```
+
+KV 先按物理 slot 写入 cache，再通过 block table 读取完整逻辑前缀。例如逻辑页顺序 `[1, 0]`，当前查询位置 2–4，Q 长度为 3，K 长度为 5；因果掩码必须按右下角对齐，分别看到 3、4、5 个历史 token。参考：[FlashAttention 因果掩码约定](https://github.com/Dao-AILab/flash-attention#changelog)。
+
+### 验证与版本信息
+
+- 新增测试实现前为 4 failed / 3 passed，四个失败分别确认混合调度、decode 预算、多 prompt chunk 和 TP decode 输入缺失；实现后相关调度/流式测试为 12 passed。
+- 在仓库外创建 Python 3.12 验证环境，原有测试基线为 19 passed / 2 skipped。依赖安装尚未结束时曾产生导入错误，安装完成后原测试通过，没有为该临时环境状态修改产品代码。
+- 分块 Attention 使用实际 `Attention.forward()`，仅 GPU store/FlashAttention 内核以 CPU 参考函数替换；三段输出与完整 PyTorch 因果 Attention 一致，覆盖物理页重排。这不等同于真实 FlashAttention GPU 内核验证。
+- 独立审查复现“部分 prompt 占用全部 KV、decode 自抢占后无法重新分配”的崩溃。新增测试先复现 `AssertionError`，再通过优先回收等待中的部分 prompt 页修复；该 prompt 稍后重新计算，已生成 token 不丢失。全套 CPU 测试最终为 27 passed / 3 skipped（包括新增可选真实 GPU Attention 测试）。`compileall` 和 `git diff --check` 通过。
+- 本机验证环境使用 CPU PyTorch，无 Triton/FlashAttention，未运行真实模型推理、CUDA Graph 或多 GPU 端到端测试；不下载模型权重，不声称吞吐或延迟提升。KV 仍为整条请求预留，长 prompt 必须能放入总 KV 容量。
+- 提交标题：`feat: interleave chunked prefill with decode`；目标分支：`main`。

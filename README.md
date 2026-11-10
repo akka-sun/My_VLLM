@@ -82,6 +82,23 @@ starting another generation; stopping early leaves requests queued. Its `text`
 is decoded from all completion tokens so multibyte token fragments can be
 resolved; replace the displayed text with this value instead of concatenating it.
 
+## Chunked prefill
+
+```python
+llm = LLM("/YOUR/MODEL/PATH", max_num_batched_tokens=512, max_num_seqs=32)
+```
+
+Each scheduler step runs active decode tokens first, then spends the remaining
+token budget on prompt chunks. With a budget of 512 and 12 decode requests, up
+to 500 prompt tokens can run in the same batch. A prompt emits its first output
+token only after its final chunk. The budget also bounds pure decode batches.
+Mixed batches use paged variable-length causal attention over the full cached
+prefix; pure decode keeps the CUDA graph path. KV blocks for a prompt are still
+reserved up front, so chunking limits compute per step, not total KV capacity.
+If decode fills every token/sequence slot, waiting prompts resume when slots
+become available. No throughput or latency improvement is claimed without a
+measurement on the target GPU/model.
+
 ## Benchmark
 
 See `bench.py` for benchmark.

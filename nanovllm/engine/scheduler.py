@@ -23,10 +23,37 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """Decode first, then fill the remaining budget with prompt chunks.
+
+        The returned flag selects varlen attention for the entire mixed batch;
+        it does not mean every sequence is still prefilling.
+        """
         scheduled_seqs = []
         num_batched_tokens = 0
+        # Keep active generations moving even while long prompts are waiting.
+        while self.running and len(scheduled_seqs) < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                # A partial prefill may have reserved the pages decode needs.
+                # Recompute that prompt later instead of stalling generation.
+                victim = next((s for s in reversed(self.waiting) if s.block_table), None)
+                if victim is not None:
+                    self.waiting.remove(victim)
+                    self.preempt(victim)
+                elif self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                self.block_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+                num_batched_tokens += 1
+        decode_seqs = list(scheduled_seqs)
+        has_prefill = False
 
-        # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -39,10 +66,9 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+            seq.is_prefill = True
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -50,27 +76,10 @@ class Scheduler:
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
-
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
+            has_prefill = True
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        self.running.extendleft(reversed(decode_seqs))
+        return scheduled_seqs, has_prefill
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -83,7 +92,7 @@ class Scheduler:
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            if seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:

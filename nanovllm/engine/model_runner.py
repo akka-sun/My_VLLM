@@ -140,7 +140,9 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            # TP decode workers only hold last_token. A mixed batch still uses
+            # the varlen path, with one query for each decode sequence.
+            input_ids.extend(seq[start:end] if seq.token_ids else [seq.last_token])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
