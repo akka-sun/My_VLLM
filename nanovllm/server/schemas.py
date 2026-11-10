@@ -16,6 +16,7 @@ class GenerationRequest(StrictModel):
     temperature: float = Field(1.0, ge=0, le=2)
     top_p: float = Field(1.0, gt=0, le=1)
     top_k: int = Field(0, ge=0, strict=True)
+    priority: int = Field(0, strict=True)
     stream: bool = False
     stream_options: StreamOptions | None = None
     n: Literal[1] = 1

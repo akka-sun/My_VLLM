@@ -47,7 +47,11 @@ class LLMEngine:
             for p in self.ps:
                 p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, *, priority: int = 0):
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("priority must be an integer")
+        if priority != 0 and self.scheduler.policy != "priority":
+            raise ValueError("nonzero priority requires scheduling_policy='priority'")
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         if not prompt or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in prompt):
@@ -62,7 +66,7 @@ class LLMEngine:
         capacity = len(self.scheduler.block_manager.blocks) * self.scheduler.block_size
         if len(prompt) + sampling_params.max_tokens - 1 > capacity:
             raise ValueError("request exceeds total KV cache capacity")
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, priority=priority)
         self.scheduler.add(seq)
         return seq.seq_id
 
@@ -72,6 +76,8 @@ class LLMEngine:
 
     def step(self, stream: bool = False):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            return [], 0
         previous_lengths = [seq.num_completion_tokens for seq in seqs] if stream else []
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)

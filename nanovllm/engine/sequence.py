@@ -8,6 +8,7 @@ from nanovllm.sampling_params import SamplingParams
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
+    PREEMPTED = auto()
     FINISHED = auto()
 
 
@@ -15,14 +16,18 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), *, priority: int = 0):
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("priority must be an integer")
         self.seq_id = next(Sequence.counter)
+        self.priority = priority
+        self.num_preemptions = 0
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
@@ -37,6 +42,19 @@ class Sequence:
 
     def __getitem__(self, key):
         return self.token_ids[key]
+
+    @property
+    def num_cached_tokens(self):
+        """Compatibility name used by the unchanged model execution path."""
+        return self.num_computed_tokens
+
+    @num_cached_tokens.setter
+    def num_cached_tokens(self, value):
+        self.num_computed_tokens = value
+
+    @property
+    def num_pending_tokens(self):
+        return self.num_tokens - self.num_computed_tokens
 
     @property
     def is_finished(self):

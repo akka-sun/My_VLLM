@@ -89,7 +89,7 @@ def create_app(model=None, *, served_model_name='nano-vllm', engine_factory=None
             top_p=body.top_p, max_tokens=body.max_tokens)
         backend = app.state.backend
         prompt = [message.model_dump() for message in body.messages] if chat else body.prompt
-        handle = await backend.add_request(prompt, params, chat=chat)
+        handle = await backend.add_request(prompt, params, chat=chat, priority=body.priority)
         response_id = ('chatcmpl-' if chat else 'cmpl-') + uuid4().hex
         created = int(time.time())
         base = {'id':response_id, 'object':'chat.completion.chunk' if chat else 'text_completion',

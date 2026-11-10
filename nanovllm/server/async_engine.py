@@ -46,12 +46,12 @@ class AsyncLLMEngine:
             raise
         self.task = asyncio.create_task(self._run(), name='nanovllm-scheduler')
 
-    async def add_request(self, prompt, sampling_params, *, chat=False):
+    async def add_request(self, prompt, sampling_params, *, chat=False, priority=0):
         if self.closing or self.failed or self.task is None or self.task.done():
             raise APIError('Inference service is unavailable', 503, 'server_error')
         future = asyncio.get_running_loop().create_future()
         try:
-            self.commands.put_nowait(('add', (prompt, sampling_params, chat), future))
+            self.commands.put_nowait(('add', (prompt, sampling_params, chat, priority), future))
         except asyncio.QueueFull:
             raise APIError('Request queue is full', 503, 'server_error') from None
         try:
@@ -72,7 +72,7 @@ class AsyncLLMEngine:
         await self.commands.put(('cancel', handle, future))
         await asyncio.shield(future)
 
-    def _add(self, prompt, params, chat):
+    def _add(self, prompt, params, chat, priority):
         if chat:
             try:
                 token_ids = self.engine.tokenizer.apply_chat_template(
@@ -81,7 +81,7 @@ class AsyncLLMEngine:
                 raise ValueError('Tokenizer cannot apply the requested chat template') from exc
         else:
             token_ids = self.engine.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
-        seq_id = self.engine.add_request(token_ids, params)
+        seq_id = self.engine.add_request(token_ids, params, priority=priority)
         return seq_id, len(token_ids)
 
     @staticmethod

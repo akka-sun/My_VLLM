@@ -129,6 +129,7 @@ def test_api_completion_chat_stream_and_errors():
                     {'model':'tiny','prompt':'a','temperature':-1},
                     {'model':'tiny','prompt':'a','n':2},
                     {'model':'tiny','prompt':'a','tools':[]},
+                    {'model':'tiny','prompt':'a','priority':2},
                     {'model':'tiny','prompt':'a'*32,'max_tokens':1},
                 ]:
                     error = await client.post('/v1/completions', json=payload)
@@ -304,6 +305,9 @@ def test_server_help_does_not_require_cuda_dependencies():
     import sys
     result = subprocess.run([sys.executable, '-m', 'nanovllm.server', '--help'], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0 and '--quantization' in result.stdout
+    for option in ['--scheduling-policy', '--long-prefill-token-threshold',
+                   '--long-prefill-token-threshold-adaptive', '--no-scheduler-reserve-full-isl']:
+        assert option in result.stdout
 
 
 def test_disconnect_before_stream_body_starts_reclaims_prefill():
@@ -347,4 +351,33 @@ def test_openai_sdk_accepts_completion_and_chat_stream():
                 chunks = [chunk async for chunk in response]
                 assert ''.join(c.choices[0].delta.content or '' for c in chunks if c.choices) == 'A'
                 assert chunks[-1].usage.total_tokens == 3
+    asyncio.run(run())
+
+
+def test_api_priority_and_async_admission_propagate_to_engine():
+    from nanovllm.server.app import create_app
+    seen = []
+
+    class PriorityEngine(LLMEngine):
+        def add_request(self, prompt, params, *, priority=0):
+            seen.append(priority)
+            return super().add_request(prompt, params, priority=priority)
+
+    def factory():
+        engine = make_engine()
+        engine.__class__ = PriorityEngine
+        engine.scheduler.policy = 'priority'
+        return engine
+
+    async def run():
+        app = create_app(engine_factory=factory, served_model_name='tiny')
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+                result = await client.post('/v1/completions', json={'model':'tiny', 'prompt':'a', 'max_tokens':1, 'priority':-3})
+                assert result.status_code == 200 and seen == [-3]
+                result = await client.post('/v1/chat/completions', json={'model':'tiny',
+                    'messages':[{'role':'user','content':'a'}], 'max_tokens':1, 'priority':2})
+                assert result.status_code == 200 and seen == [-3, 2]
+                result = await client.post('/v1/completions', json={'model':'tiny','prompt':'a','max_tokens':1,'priority':True})
+                assert result.status_code == 400 and seen == [-3, 2]
     asyncio.run(run())

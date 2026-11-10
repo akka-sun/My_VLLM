@@ -97,15 +97,16 @@ def test_cache_pressure_preempts_and_recomputes_without_duplicate_output():
     assert b.is_finished and b.completion_token_ids == [7, 7]
 
 
-def test_decode_reclaims_partial_prompt_cache_before_preempting_itself():
+def test_incremental_partial_prompt_cache_preserves_decode_progress_under_pressure():
     sched = scheduler(budget=257, blocks=3)
     a = Sequence([1] * 256, SamplingParams(max_tokens=2))
     b = Sequence([2] * 257, SamplingParams(max_tokens=1))
     sched.add(a)
     sched.add(b)
-    tick(sched)  # A completes prefill; B reserves two pages and computes one token.
+    tick(sched)  # A completes prefill; B only allocates its first page.
     assert b.num_cached_tokens == 1
-    tick(sched)  # A needs another page; reclaim B's partial prefill, then decode A.
+    assert len(sched.block_manager.free_block_ids) == 1
+    tick(sched)  # A can acquire the remaining page and finish its decode.
     assert a.is_finished
     for _ in range(3):
         if sched.is_finished():

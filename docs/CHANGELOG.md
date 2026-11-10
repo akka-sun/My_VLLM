@@ -341,3 +341,113 @@ class CancellableStreamingResponse(StreamingResponse):
 - 测试中的模型执行为可控替代；没有模型权重或真实 GPU HTTP 端到端推理，性能/精度仍未测量。真实 GPU 内核测试保持明确 skip。
 - 最终 `python -m pytest -q`：46 passed / 9 skipped；`python -m compileall -q nanovllm tests`、`git diff --check` 通过。验证环境为 Python 3.12、CPU PyTorch 2.15、Transformers 5.22、FastAPI 0.162，OpenAI SDK 3.48；未覆盖所有依赖最低版本组合。
 - 提交标题：`feat: serve OpenAI-compatible async completions API`；目标分支：`main`。
+
+## 2026-11-10：按 vLLM V1 对齐调度状态、分块策略、增量 KV 与抢占
+
+### 需求、参考与方案
+
+用户要求将对比中的前四项按照 vLLM 优化，明确排除最后一项执行路径。本次对齐现有 dense Qwen3 所需的 V1 调度语义：统一 token 进度、长 prefill 阈值、增量 KV 分配、FCFS/priority 抢占重算。没有改动 `Attention`、`ModelRunner` 或 CUDA Graph 的选择与执行。
+
+参考检查时的 vLLM HEAD：`0d96fb65891e13f2b1a1037684e59ebff9d26e7a`：
+
+- [Scheduler](https://github.com/vllm-project/vllm/blob/0d96fb65891e13f2b1a1037684e59ebff9d26e7a/vllm/v1/core/sched/scheduler.py)：RUNNING 优先于 WAITING、统一进度、长请求阈值、抢占预算回滚、发生抢占的步骤不准入等待请求。
+- [KVCacheManager](https://github.com/vllm-project/vllm/blob/0d96fb65891e13f2b1a1037684e59ebff9d26e7a/vllm/v1/core/kv_cache_manager.py)：按本轮末尾分配 slot，将完整输入准入检查与实际分配分开。
+- [SchedulerConfig](https://github.com/vllm-project/vllm/blob/0d96fb65891e13f2b1a1037684e59ebff9d26e7a/vllm/config/scheduler.py)：FCFS/priority、长 prefill 阈值、完整输入准入配置。当前参考版本已无旧版 `max_num_partial_prefills`，本次不引入过时选项。
+
+沿用用户“直接实施、跳过设计问答”的偏好。选择直接统一状态和分配接口，而非在旧 prefill/decode 双阶段外再叠加分支；后者无法自然处理已入场的部分 prefill 和已安排工作的抢占。完整模型生态中的多模态、Mamba、推测解码和远程 KV 不在当前项目支持范围，本次不宣称逐项复制整个 vLLM。
+
+### 主体修改
+
+- `nanovllm/engine/sequence.py`：新增 `num_computed_tokens`、`num_pending_tokens`、priority 与抢占计数，增加 PREEMPTED 状态；`num_cached_tokens` 保留兼容别名，以维持原模型准备与 TP 序列化接口。
+- `nanovllm/engine/scheduler.py`：RUNNING 同时管理部分 prefill 与 decode；统一分配 token 预算，支持阈值/自适应阈值、完整输入准入、FCFS/priority 等待排序与抢占；撤销本轮受害请求工作并恢复预算。
+- `nanovllm/engine/block_manager.py`：用 `get_computed_blocks()`、`allocate_slots()` 代替按完整 prompt 预分配和独立 append 接口；采用前缀命中先固定、只分配本轮新增页、失败不改变状态的流程。
+- `nanovllm/config.py`：新增并验证 `scheduling_policy="fcfs"`、`long_prefill_token_threshold=0`、`long_prefill_token_threshold_adaptive=False`、`scheduler_reserve_full_isl=True`。
+- `nanovllm/engine/llm_engine.py`：`add_request(..., priority=0)`；非零 priority 需启用 priority 策略；空调度步不提交空模型批次。
+- `nanovllm/server/{schemas,app,async_engine,__main__}.py`：API priority 透传、CLI 调度参数；线程所有权和 SSE 实时性沿用原逻辑。
+- `tests/test_scheduler_v1.py`：新增统一状态、阈值、增量页、前缀生命周期、策略与回滚、重算、配置和多种确定性工作负载测试；更新 `test_chunked_prefill.py` 的历史预分配假设说明，扩充 API 测试。
+- `README.md`：更新当前行为、默认参数、priority 用法以及与原执行路径的关系。以上历史记录保持原样，反映各提交当时的行为。
+
+### 核心逻辑、分段解释与示例
+
+**1. 用统一进度表示 prompt、decode 和重算**
+
+```python
+pending = seq.num_tokens - seq.num_computed_tokens
+seq.num_scheduled_tokens = min(pending, budget, threshold or pending)
+```
+
+首次准入即进入 RUNNING，不再让部分 prefill 留在 WAITING。例如 prompt 长 6、预算 2，第一步后 RUNNING 中该请求的 computed=2、pending=4、输出为空；后续步骤继续推进同一游标。decode 通常 pending=1，抢占后则连同已生成历史一起重算。RUNNING 保持入场顺序，而不是每轮重新强制 decode-first；这是此次按实际 V1 源码对齐的行为变化。
+
+```python
+seq.is_prefill = computed < prompt_length or pending > 1
+```
+
+该标记仅为原执行路径提供元数据。例如原 prompt 为 `[1,2]`、已有输出 `[7,8]`，重算到 computed=2、本轮阈值只允许 1 token 时，应向 TP worker 保留完整 `[1,2,7,8]`，本轮输入是历史 token 7；不能因 chunk 长度为 1 而错误地只发送最后 token 8。
+
+**2. 长请求阈值和自适应预算**
+
+```python
+threshold = configured_threshold if eligible_requests > 1 else 0
+if threshold and adaptive:
+    threshold = max(threshold, batch_budget // eligible_requests)
+```
+
+例如预算 8、阈值 1、一个长 prompt 和一个单 token 短 prompt：关闭 adaptive 时分别计算 1、1 tokens；开启时公平份额为 4，长 prompt 可计算 4 tokens，短 prompt 计算 1 token。短请求结束后只有一个请求，无论该阈值原来是多少，该请求都可用满预算 8。0 表示不设置额外上限；token 和 active-request 上限仍是硬限制。
+
+**3. 增量页分配与准入容量分离**
+
+```python
+end = computed + num_new_tokens
+new_pages = ceil(end / block_size) - existing_pages
+if required_free_pages > available_free_pages:
+    return None
+```
+
+例如 prompt 为 1024 tokens、页大小 256、每步计算 128：第一轮分配 1 页，第二轮仍为 1 页，第三轮才增长到 2 页；旧实现第一轮就占用 4 页。`scheduler_reserve_full_isl=True` 会先检查当前完整输入能否容纳，但不物理预分配剩余 3 页。关闭该准入门槛可增加并发入场，也可能增加后续抢占；即使开启，仍不保证永不抢占。GPU KV 池由 ModelRunner 预先创建，本次改善的是池内空闲页利用，不代表 GPU 进程已分配的总显存或峰值实测下降。
+
+```python
+for block_id in computed_blocks:
+    pin_or_increment_ref_count(block_id)
+new_blocks = [allocate_block() for _ in range(num_new_blocks)]
+```
+
+先固定全部命中页，再从空闲 LRU 取新页。例如页 0 是缓存前缀且排在空闲队首，若先取新页，会把刚命中的页 0 淘汰；本次先固定页 0，再分配页 1。分配失败发生在固定/修改之前，游标、引用计数、空闲队列保持不变。命中仅使用完整页，至少留一个 query token；完整 512-token 输入的缓存命中也不会跳过所有查询而无法采样。
+
+**4. 策略抢占、预算回滚与重算**
+
+```python
+victim = (max(running, key=lambda s: (s.priority, s.seq_id))
+          if policy == "priority" else running[-1])
+if victim in scheduled:
+    scheduled.remove(victim)
+    budget += victim.num_scheduled_tokens
+```
+
+FCFS 选择最晚入场的 RUNNING 请求；priority 选择更大 priority 值、相同值下更晚到达的请求。优先级数字越小越重要；等待队列按 priority 与原始到达顺序准入，但不会每轮重排所有 RUNNING。例如预算 2，先安排低优先级 A 的 1 token，再发现 B 扩容要抢占 A，则撤销 A 并归还预算，使 B 和后续 C 都能执行，而不是只剩一个 token 的预算。
+
+```python
+seq.num_scheduled_tokens = 0
+seq.num_computed_tokens = 0
+seq.num_preemptions += 1
+```
+
+抢占只丢弃需要重新计算的进度和页引用，保留 prompt 与生成输出，并回到等待队列。例如已有输出 `[7]` 的请求被抢占，重放历史时流式事件为空；追上原 token 长度后才追加新的 7，客户端只再收到 `[7]`，不会把原输出重新发送。完整缓存前缀可重新命中，未完成页不共享；发生抢占的当前步骤不立即重新准入等待请求，以避免刚释放的页立刻被取回。可通过 `llm.scheduler.num_preemptions` 观察累计次数。
+
+**配置与请求入口**
+
+```python
+llm = LLM(path, scheduling_policy="priority", long_prefill_token_threshold=128)
+request_id = llm.add_request("Hello", params, priority=-1)
+```
+
+API 的 completion/chat 请求也可带 `priority=-1`。CLI 对应 `--scheduling-policy priority`、`--long-prefill-token-threshold 128`，可选 `--long-prefill-token-threshold-adaptive`、`--no-scheduler-reserve-full-isl`。例如 FCFS 模式提交非零 priority 返回 400，避免参数被默默忽略；非法阈值、预算、策略和布尔值会明确报错。
+
+### 验证与版本信息
+
+- 变更前全套基线为 46 passed / 9 skipped。第一批新测试先得到 23 failed / 1 passed，确认缺失统一 RUNNING、阈值、增量分配和 priority；核心实现后该批 24 passed。
+- 引擎空批次、priority 透传与 API 测试先出现 3 个预期失败，CLI 新参数帮助测试也先失败；接通后通过。
+- 调度测试覆盖页边界、原子失败、命中页先固定、共享前缀取消与最终释放、FCFS/priority 抢占、已调度 victim 的工作/预算撤销、重算保留输出、单 token TP 序列化、流式 delta 不重复，以及 12 组确定性不同预算/策略/前缀/准入选项工作负载的完成性与引用计数不变量。
+- 独立审查未发现明确的严重正确性缺陷；根据建议补充共享前缀取消、TP 单 token 重算和流式重算的永久回归测试。
+- 最终 `python -m pytest -q`：86 passed / 9 skipped；`python -m compileall -q nanovllm tests` 和 `git diff --check` 通过；`git diff --exit-code -- nanovllm/engine/model_runner.py nanovllm/layers/attention.py` 确认执行路径文件无改动。
+- 继续使用 Python 3.12 CPU 验证环境；实际 Attention/Triton、CUDA Graph、多 GPU TP 与真实模型吞吐/延迟未实测，不声明性能提升。之前可选 GPU 测试仍因依赖/设备环境跳过。
+- 提交标题：`feat: align scheduler and incremental KV allocation with vLLM V1`；目标仓库 `akka-sun/My_VLLM`，目标分支 `main`。

@@ -1,6 +1,6 @@
 from collections import deque
 
-from nanovllm.config import Config
+from nanovllm.config import Config, validate_scheduler_config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
@@ -8,8 +8,14 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
+        validate_scheduler_config(config)
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.policy = getattr(config, "scheduling_policy", "fcfs")
+        self.long_prefill_token_threshold = getattr(config, "long_prefill_token_threshold", 0)
+        self.adaptive_threshold = getattr(config, "long_prefill_token_threshold_adaptive", False)
+        self.reserve_full_isl = getattr(config, "scheduler_reserve_full_isl", True)
+        self.num_preemptions = 0
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -20,7 +26,20 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        self.waiting.append(seq)
+        if seq.num_tokens > len(self.block_manager.blocks) * self.block_size:
+            raise ValueError("sequence exceeds total KV cache capacity")
+        self._enqueue(seq)
+
+    def _enqueue(self, seq: Sequence, *, preempted=False):
+        if self.policy == "priority":
+            key = (seq.priority, seq.seq_id)
+            index = next((i for i, other in enumerate(self.waiting)
+                          if (other.priority, other.seq_id) > key), len(self.waiting))
+            self.waiting.insert(index, seq)
+        elif preempted:
+            self.waiting.appendleft(seq)
+        else:
+            self.waiting.append(seq)
 
     def abort(self, seq_id: int) -> bool:
         for queue in (self.waiting, self.running):
@@ -34,76 +53,89 @@ class Scheduler:
         return False
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        """Decode first, then fill the remaining budget with prompt chunks.
+        """Advance RUNNING token cursors, then admit WAITING requests.
 
-        The returned flag selects varlen attention for the entire mixed batch;
-        it does not mean every sequence is still prefilling.
+        RUNNING includes partial prefills and decode. The returned bool only
+        selects the existing varlen-vs-decode execution path.
         """
         scheduled_seqs = []
-        num_batched_tokens = 0
-        # Keep active generations moving even while long prompts are waiting.
-        while self.running and len(scheduled_seqs) < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                # A partial prefill may have reserved the pages decode needs.
-                # Recompute that prompt later instead of stalling generation.
-                victim = next((s for s in reversed(self.waiting) if s.block_table), None)
-                if victim is not None:
-                    self.waiting.remove(victim)
-                    self.preempt(victim)
-                elif self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-                num_batched_tokens += 1
-        decode_seqs = list(scheduled_seqs)
-        has_prefill = False
+        budget = self.max_num_batched_tokens
+        eligible = len(self.running) + len(self.waiting)
+        threshold = self.long_prefill_token_threshold if eligible > 1 else 0
+        if threshold and self.adaptive_threshold:
+            threshold = max(threshold, budget // eligible)
 
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
-                    break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
-            seq.is_prefill = True
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
+        def chunk_size(pending):
+            return min(pending, budget, threshold or pending)
+
+        def record(seq, count):
+            # A one-token recompute chunk may still need historical token IDs
+            # in TP workers, so derive this from progress, not chunk size.
+            seq.is_prefill = seq.num_computed_tokens < seq.num_prompt_tokens or seq.num_pending_tokens > 1
+            seq.num_scheduled_tokens = count
             scheduled_seqs.append(seq)
-            has_prefill = True
-        assert scheduled_seqs
-        self.running.extendleft(reversed(decode_seqs))
-        return scheduled_seqs, has_prefill
+
+        preempted = False
+        index = 0
+        while index < len(self.running) and budget > 0:
+            seq = self.running[index]
+            count = chunk_size(seq.num_pending_tokens)
+            allocated = self.block_manager.allocate_slots(seq, count)
+            while allocated is None:
+                victim = (max(self.running, key=lambda s: (s.priority, s.seq_id))
+                          if self.policy == "priority" else self.running[-1])
+                victim_index = self.running.index(victim)
+                if victim in scheduled_seqs:
+                    scheduled_seqs.remove(victim)
+                    budget += victim.num_scheduled_tokens
+                self.running.remove(victim)
+                if victim_index < index:
+                    index -= 1
+                self.preempt(victim)
+                preempted = True
+                if victim is seq:
+                    break
+                allocated = self.block_manager.allocate_slots(seq, count)
+            if allocated is None:
+                if self.policy == "priority" and seq.status == SequenceStatus.PREEMPTED:
+                    continue
+                break
+            record(seq, count)
+            budget -= count
+            index += 1
+
+        # Re-admission on a preempting step would immediately reclaim pages
+        # just released to let RUNNING work progress.
+        while not preempted and self.waiting and len(self.running) < self.max_num_seqs and budget > 0:
+            seq = self.waiting[0]
+            hits = self.block_manager.get_computed_blocks(seq)
+            count = chunk_size(seq.num_tokens - len(hits) * self.block_size)
+            allocated = self.block_manager.allocate_slots(seq, count, hits,
+                full_sequence_must_fit=self.reserve_full_isl)
+            if allocated is None:
+                break
+            self.waiting.popleft()
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+            record(seq, count)
+            budget -= count
+        return scheduled_seqs, any(seq.is_prefill for seq in scheduled_seqs)
 
     def preempt(self, seq: Sequence):
-        seq.status = SequenceStatus.WAITING
+        seq.status = SequenceStatus.PREEMPTED
         seq.is_prefill = True
+        seq.num_scheduled_tokens = 0
+        seq.num_preemptions += 1
+        self.num_preemptions += 1
         self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        self._enqueue(seq, preempted=True)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_computed_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if seq.num_cached_tokens < seq.num_tokens:
+            if seq.num_computed_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
