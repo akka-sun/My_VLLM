@@ -145,3 +145,19 @@ sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e
 - `python -m compileall -q nanovllm tests` 通过。2 条警告来自环境中的 botocore 弃用 API。
 - 受第一项记录中的 Windows/CUDA 依赖限制，未下载权重或运行真实模型端到端推理。启用过滤需排序，可能增加耗时；未实测性能，不声明提速。
 - 提交标题：`feat: support per-request top-k and top-p sampling`；目标分支：`main`。
+
+## 2026-11-12：补充流式输出讲解和代码讲解约定
+
+用户希望结合源码理解流式输出，并在以后提问时把通俗讲解写入仓库根目录的 `explain.md`。
+
+- `AGENTS.md` 增加代码讲解约定。首次新建 `explain.md`，后续按主题追加或更新。例如，下次讲解调度器时可以追加新章节，保留流式输出章节。
+- `explain.md` 从 `LLMEngine.generate_stream()` 的请求入队讲到模型采样、调度器更新、切片和累计解码。示例中的第一轮返回 `[101]` 和「你」，第二轮返回 `[102]` 和「你好」，并标记完成。
+
+```python
+seq.completion_token_ids[previous_length:]
+```
+
+这段现有逻辑提取本轮新增的 token ID。例如上一轮已生成 `[101]`，当前累计为 `[101, 102]`，从旧长度 1 切片后得到 `[102]`。生成器把它加入对应请求的累计列表，再解码成「你好」。
+
+- 验证通过。检查了 Markdown 相对链接和 Git 差异，并运行 `python -m pytest -q tests/test_streaming.py`（设置 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` 和 `USE_TF=0`），结果为 5 项通过，2 条环境依赖弃用警告。测试使用真实调度器和替代模型运行器，未执行真实模型端到端推理。
+- 提交标题为 `docs: explain token streaming and record walkthrough convention`，目标分支为 `origin/main`。
