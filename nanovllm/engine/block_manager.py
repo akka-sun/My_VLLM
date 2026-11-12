@@ -26,6 +26,8 @@ class Block:
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
+        if num_blocks < 1 or block_size < 1:
+            raise ValueError("KV cache block count and size must be positive")
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
@@ -55,30 +57,50 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def get_computed_blocks(self, seq: Sequence) -> list[int]:
+        """Find reusable full prefix pages, leaving at least one query token.
+
+        This is an advisory lookup; allocate_slots pins these pages atomically
+        before evicting anything from the free-page LRU.
+        """
         h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
+        hits = []
+        for i in range((seq.num_tokens - 1) // self.block_size):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+            hits.append(block_id)
+        return hits
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
-        assert not seq.block_table
-        h = -1
-        for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
+    def allocate_slots(self, seq: Sequence, num_new_tokens: int,
+                       computed_blocks: list[int] | None = None, *,
+                       full_sequence_must_fit: bool = False) -> list[int] | None:
+        """Allocate only through this step's end; failure has no side effects.
+
+        The full-sequence gate checks admission capacity without allocating
+        future prompt pages. Prefix pages may be active/shared or free/cached.
+        """
+        if num_new_tokens < 1:
+            raise ValueError("num_new_tokens must be positive")
+        computed_blocks = computed_blocks or []
+        if seq.block_table and computed_blocks:
+            raise ValueError("prefix adoption requires an unallocated sequence")
+        computed = len(computed_blocks) * self.block_size if computed_blocks else seq.num_computed_tokens
+        end = computed + num_new_tokens
+        if end > seq.num_tokens:
+            raise ValueError("scheduled tokens exceed sequence length")
+        existing = len(seq.block_table) + len(computed_blocks)
+        num_new_blocks = max(0, (end + self.block_size - 1) // self.block_size - existing)
+        free_hits = sum(self.blocks[i].ref_count == 0 for i in computed_blocks)
+        required = num_new_blocks
+        if full_sequence_must_fit:
+            required = max(required, (seq.num_tokens + self.block_size - 1) // self.block_size - existing)
+        if free_hits + required > len(self.free_block_ids):
+            return None
+        # Pin ALL hits before allocating: a free hit might be first in the LRU.
+        for block_id in computed_blocks:
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
                 block.ref_count += 1
@@ -87,9 +109,10 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
-            seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        new_blocks = [self._allocate_block() for _ in range(num_new_blocks)]
+        seq.block_table.extend(new_blocks)
+        seq.num_computed_tokens = computed
+        return new_blocks
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -97,15 +120,8 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
+        seq.num_computed_tokens = 0
         seq.block_table.clear()
-
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
-
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
-            seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
