@@ -169,3 +169,106 @@ outputs = llm.generate(["解释一下 KV Cache"], params)
 此调用逐轮产生 logits，每轮温度缩放后先保留前 50 名，再取累计概率达到 0.9 的最短前缀，最后随机选一个 token；并非一次选出 50 个输出 token。参数要求 k 为非负整数、p 在 `(0,1]`。本地 SamplingParams 要求正温度；HTTP 层对 0 或极小温度另做 top-1 转换。
 
 相关测试见 [test_sampling.py](tests/test_sampling.py)，覆盖候选集合、Top-p 跨阈值/恰好到阈值、两个过滤器组合、默认行为和极小 p。以上概率与 token ID 是教学示例，不代表真实模型对某句 prompt 的实测预测。
+
+## Chunked Prefill：长 prompt 如何分轮计算
+
+核心是：**每轮只计算 prompt 尚未完成的一段，并保存这段的 KV；下一轮计算新的一段时，Attention 仍能读取全部已计算前缀。** chunk 不是相互独立的小 prompt，也不会每算完一块就生成一段回答。
+
+调用链为 `LLMEngine.step()` → `Scheduler.schedule()` → `BlockManager.allocate_slots()` → `ModelRunner.run()/prepare_prefill()` → `Attention.forward()` → `Scheduler.postprocess()`。入口和相关实现分别见 [引擎](nanovllm/engine/llm_engine.py)、[调度器](nanovllm/engine/scheduler.py)、[KV 页管理](nanovllm/engine/block_manager.py)、[模型执行器](nanovllm/engine/model_runner.py) 和 [Attention](nanovllm/layers/attention.py)。
+
+### 1. 用进度游标记录算到哪里
+
+```python
+pending = seq.num_tokens - seq.num_computed_tokens
+count = min(pending, budget, threshold or pending)
+seq.num_scheduled_tokens = count
+```
+
+`num_tokens` 是当前历史总长度，`num_computed_tokens` 是已有 KV 的前缀长度，`num_scheduled_tokens` 是本轮计划计算的长度。`Sequence.num_cached_tokens` 是 computed 的兼容别名，模型执行器仍使用这个名字。例如 prompt 长 8，computed=2，剩余预算 3，生效的阈值为 2，则本轮计算 2 tokens：零基位置 2、3，不重新计算位置 0、1。
+
+调度器在首次准入时就把请求移入 RUNNING，后续 chunk 继续推进同一个请求。RUNNING 同时包含部分 prefill 和 decode；先按现有入场顺序处理 RUNNING，再用剩余预算准入 WAITING。因此当前代码没有每轮重新强制把所有 decode 排到最前。
+
+### 2. chunk 长度由本轮预算决定
+
+`max_num_batched_tokens` 是整批 token 上限，`long_prefill_token_threshold` 是多个请求同时存在时每条请求的额外上限。阈值 0 关闭该限制；只剩一个请求时忽略阈值，允许用满预算。开启 adaptive 时，有效阈值至少为 `batch_budget // eligible_requests`。
+
+例如预算 4、阈值 2，B 已在 decode，A 是新来的 8-token prompt，且 B 在以下四轮中始终未结束：
+
+| 轮次 | B 本轮工作 | A 本轮 prompt 位置 | A 计算后进度 | A 是否产生输出 |
+| --- | --- | --- | --- | --- |
+| 1 | 1 个 decode token | 0、1 | 2/8 | 否 |
+| 2 | 1 个 decode token | 2、3 | 4/8 | 否 |
+| 3 | 1 个 decode token | 4、5 | 6/8 | 否 |
+| 4 | 1 个 decode token | 6、7 | 8/8 | 是，采样首个新 token |
+
+每轮合计 3 tokens，小于预算 4，是因为 A 的阈值限制为 2；预算是上限，不要求必须填满。如果 B 提前结束，后续仅剩 A，A 便可使用整轮预算。A 产生首个输出后，通常变成 pending=1，与其他 decode 一样每轮继续推进一个 token。
+
+### 3. KV 页只分配到本轮计算末尾
+
+```python
+end = computed + num_new_tokens
+num_new_blocks = max(0, ceil(end / block_size) - existing_blocks)
+```
+
+上面是 `allocate_slots()` 的分配公式示意，实际代码用整数除法向上取整。例如 prompt 长 1024、块大小 256、每轮处理 128：第一轮分配 1 页，第二轮复用这一页，第三轮才增长到 2 页。chunk 的长度和物理页大小是两回事；同一页可以由多个 chunk 逐步填满。
+
+默认 `scheduler_reserve_full_isl=True` 会在准入时检查完整输入的容量，但不会提前占用所有未来页。已有完整前缀页可被命中并按引用计数共享；先固定命中页，再分配新页，避免新分配淘汰刚命中的缓存。例如两个请求共享前 256 tokens，只需共同持有一份该前缀页，后续未完成页各自拥有。
+
+GPU KV 池本身已由模型执行器预分配，增量管理改善的是池内空闲页可用性，不代表进程分配的 GPU 显存自动减少。
+
+### 4. 模型只接收当前 chunk，位置编号保持连续
+
+```python
+start = seq.num_cached_tokens
+end = start + seq.num_scheduled_tokens
+input_ids.extend(seq[start:end] if seq.token_ids else [seq.last_token])
+positions.extend(range(start, end))
+seqlen_q = seq.num_scheduled_tokens
+seqlen_k = end
+```
+
+`prepare_prefill()` 只抽取这次需要计算的 token，位置不从 0 重新开始。例如 A 的 prompt 为 `[10,11,12,13,14,15,16,17]`，第二个 chunk 输入是 `[12,13]`、位置为 `[2,3]`，Q 长度为 2，但 K/V 的有效总长度为 4。`cu_seqlens_q/k` 记录每条请求的边界，使一个扁平批次仍能区分不同请求；`slot_mapping` 标明新 KV 应写入哪些物理位置。
+
+混合批次中的 decode 请求也可用这条变长路径：其 Q 长度为 1，K 长度为整个上下文。TP worker 对普通 decode 仅保存最后一个 token，因此输入准备保留 `[seq.last_token]` 分支；需要重放历史的单 token chunk 则保留完整历史。
+
+### 5. Attention 用当前 Q 读取完整缓存前缀
+
+```python
+store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+if context.block_tables is not None:
+    k, v = k_cache, v_cache
+# 随后调用 flash_attn_varlen_func(..., causal=True, block_table=...)
+```
+
+这是 `Attention.forward()` 的关键流程摘录：有实际 KV cache 时，先写入当前 chunk 的 K/V；有历史前缀时，通过 block table 从缓存读取完整 K/V。第二个 chunk 的 Q 虽然只有位置 2、3，Attention 却能看到位置 0–3 的 K/V，因果掩码分别允许位置 2 看 0–2、位置 3 看 0–3。这样后一个 chunk 能接上前面的上下文，而不是只在 `[12,13]` 内做 Attention。
+
+当前实现混合批次使用变长 Attention，纯 decode 沿用原 decode/CUDA Graph 路径。分块减少每轮新增查询量，但当前 chunk 仍要读取其可见历史；不等于每个 chunk 的计算成本都恒定。
+
+### 6. 最后一个 chunk 才确认生成 token
+
+```python
+self.block_manager.hash_blocks(seq)
+seq.num_computed_tokens += seq.num_scheduled_tokens
+seq.num_scheduled_tokens = 0
+if seq.num_computed_tokens < seq.num_tokens:
+    continue
+seq.append_token(token_id)
+```
+
+`postprocess()` 发布已经计算完的完整 KV 块，再推进游标。模型执行器当前会给中间 chunk 也计算候选 token，但只要尚未算完当前历史，该候选就被忽略。例如 A 的前 3 个 chunk 不追加输出，第四轮 computed 追上 8，才把候选 101 追加到序列。此时长度变成 9、computed 仍为 8，下一轮输入 101，计算它的 KV，再采样下一个 token。
+
+若 KV 不足，调度器按 FCFS 或 priority 抢占请求，释放页引用、重置 computed 并保留已有输出，稍后重算；重放中间 chunk 同样不重复输出。例如已经生成 `[101]` 后被抢占，重算历史不会重新向流式客户端发送 101，追上历史后才产生新的输出。
+
+### 用法与验证入口
+
+```python
+llm = LLM(
+    model_path, max_num_batched_tokens=512,
+    long_prefill_token_threshold=128,
+)
+outputs = llm.generate([long_prompt, short_prompt], SamplingParams(max_tokens=32))
+```
+
+512 限制整批本轮工作量；多个请求同时存在时，128 限制单请求占用的 token 数量，不是把 prompt 预先切成固定大小字符串。分块以 token 为单位，实际长度还取决于缓存命中、剩余预算和剩余历史。
+
+相关测试见 [test_scheduler_v1.py](tests/test_scheduler_v1.py)、[test_chunked_prefill.py](tests/test_chunked_prefill.py) 和 [test_attention_cuda.py](tests/test_attention_cuda.py)。它们分别覆盖状态/分配/抢占、混合输入与分块 Attention 参考数值、可选真实 GPU Attention。CPU 参考测试不等同于真实 GPU 性能验证。

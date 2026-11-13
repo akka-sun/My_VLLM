@@ -498,3 +498,33 @@ remove = previous >= top_p
 - 本次只更新说明，不修改推理行为；教学概率和 token ID 不是模型实测，不声称性能提升。真实 GPU 推理不在本次验证范围。
 - `python -m pytest -q tests/test_sampling.py tests/test_streaming.py`：19 passed / 2 skipped；跳过 CUDA 相关测试。`explain.md` 的 13 个相对链接全部有效，`git diff --check` 通过。
 - 提交标题：`docs: explain inference steps and top-k top-p sampling`；目标分支：`main`。
+
+## 2026-11-13：补充 Chunked Prefill 实现讲解
+
+### 需求与主体修改
+
+用户询问 Chunked Prefill 如何实现，按 AGENTS.md 将讲解追加到 `explain.md`，保留已有流式输出、step 和 Top-k/Top-p 主题。本次只更新说明。
+
+- `explain.md`：沿 `step → schedule → allocate_slots → prepare_prefill → Attention → postprocess` 解释调用、状态、数据形状与输出。
+- `docs/CHANGELOG.md`：追加记录、示例和验证限制。
+
+### 核心段落与示例
+
+```python
+count = min(pending, budget, threshold or pending)
+```
+
+以 8-token prompt、预算 4、阈值 2 和一个持续 decode 的请求为例，逐轮展示 2+1 的混合批次，前三轮不追加输出，第四轮才生成首个 token。补充单请求绕过阈值、RUNNING 入场顺序与非严格 decode-first 的实际语义。
+
+```text
+第二个 chunk：输入位置 [2,3]，Q 长度 2，K/V 有效总长度 4
+```
+
+说明连续位置、slot mapping 和 block table 如何把当前 Q 接到完整 KV 前缀，因果掩码使位置 2/3 分别看到 0–2/0–3。另用 1024-token prompt、256-token 页、128-token chunk 展示增量分配，不混淆 chunk 与物理页；解释完整输入准入检查、共享前缀和抢占重算。
+
+### 验证与版本信息
+
+- 对照当前 Sequence、Scheduler、BlockManager、ModelRunner、Attention 和 LLMEngine 核对讲解；教学输入并非真实模型预测。
+- 不修改生产代码，不声明性能提升；GPU KV 池预分配总量不因增量页管理自动下降。真实 GPU 推理和性能不属于本次文档验证范围。
+- `python -m pytest -q tests/test_scheduler_v1.py tests/test_chunked_prefill.py tests/test_attention_cuda.py`：47 passed / 1 skipped（真实 CUDA Attention 测试）；21 个讲解相对链接有效，`git diff --check` 通过。
+- 提交标题：`docs: explain chunked prefill scheduling and attention`；目标分支：`main`。
