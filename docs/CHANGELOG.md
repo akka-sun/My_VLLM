@@ -559,3 +559,36 @@ last_indices = context.cu_seqlens_q[1:] - 1
 - 对照当前调度、模型输入、Attention、LM Head 与输出代码核对文档；教学 token ID 不代表模型预测，不宣称 GPU 并行度或性能收益。
 - 运行混合调度、实际输入准备/TP 状态和 RUNNING 顺序三项相关测试，结果 3 passed；讲解中的 28 个相对链接有效，`git diff --check` 通过。GPU 传输在输入准备测试中替换为 CPU，未进行真实 GPU 性能验证。
 - 提交标题：`docs: explain mixed prefill and decode batching`；目标分支：`main`。
+
+## 2026-11-13：补充端到端计算流程与双请求示例
+
+### 需求与主体修改
+
+用户要求用例子走完 Nano-vLLM 的全部计算流程。按 AGENTS.md，在 `explain.md` 保留原章节并追加“从加载模型到返回文本”，覆盖初始化、权重加载、请求入队、三轮调度、Transformer 各层、采样、缓存释放与返回值。本次只修改说明。
+
+- `explain.md`：使用两请求、预算 3、输出上限 2 的例子，将入口函数、状态和张量形状逐段对应到源码。
+- `docs/CHANGELOG.md`：记录文档范围、代表性代码、示例验证与限制。
+
+### 核心段落与示例
+
+```text
+第一轮 A:[11,12,13]
+第二轮 A:[14] + B:[21,22]
+第三轮 A:[101] + B:[201]
+```
+
+说明第一轮中间 chunk 不产生正式输出，第二轮完成两请求的 prefill 并产生 101/201，第三轮两个请求一起 decode 产生 102/202 并结束。展示 positions、Q/K 长度、slot、物理页、computed/num_tokens 的变化；明确新采样 token 的 KV 要到下一轮输入时才计算。
+
+```text
+Embedding → RMSNorm → QKV/Norm/RoPE → KV/Attention → O projection
+          → 残差与 RMSNorm → gate/up/SiLU/down → 层循环 → 最终 Norm → LM Head
+```
+
+用 hidden=16、2 个 Q heads、1 个 KV head、head_dim=8、MLP=32、词表=512 的教学尺寸解释 `[T,16] → Q:[T,2,8]/KV:[T,1,8]` 和门控 MLP 的形状。说明源码通过 residual 融合部分加法和归一化；混合批次的 LM Head 按 cu_seqlens 选每条请求的最后查询，再按请求采样。
+
+### 验证与版本信息
+
+- 用仓库外的临时 walkthrough 脚本调用真实 LLMEngine/Scheduler/BlockManager，替换 GPU 模型执行与 tokenizer，逐轮断言输入、流式增量、统计值 `[3,3,-2]`、8 页最终全部释放，并核对普通 generate 返回的两个完整结果。脚本执行通过，教学文本和 token ID 为固定假设。
+- 核对实际 Qwen3、RMSNorm、RoPE、SiluAndMul、ParallelLMHead、加载与 KV 初始化源码。没有加载真实权重、运行教学 Transformer GPU 前向或测量性能，不宣称示例为模型实测预测。
+- `python -m pytest -q tests/test_streaming.py tests/test_chunked_prefill.py`：13 passed；讲解的 34 个相对链接有效，`git diff --check` 通过。
+- 提交标题：`docs: walk through end-to-end inference with two requests`；目标分支：`main`。

@@ -334,3 +334,235 @@ x = x[last_indices].contiguous()
 随后 A 的 computed 从 2 变为 5，尚未追上长度 8，其候选忽略；B 的 computed 从 6 变为 7，已追上当前历史，可追加候选 28。于是本轮 `step(stream=True)` 只返回 B 的新增 `[28]`。等 A 完成最后一个 prompt chunk，才返回 A 的第一个新 token。
 
 实现与验证入口分别是 [混合调度测试](tests/test_chunked_prefill.py)、[统一进度与运行顺序测试](tests/test_scheduler_v1.py)。其中 `test_mixed_tp_batch_builds_positions_slots_and_full_context` 调用实际输入准备代码，验证混合输入、位置、slot、Q/K 边界和 TP decode 序列；本机测试替换 GPU 传输，不代表真实 GPU 并发或性能实测。
+
+## 从加载模型到返回文本：两个请求走完全流程
+
+这一节把前面的概念连起来：`LLM(...)` 先完成一次性初始化，`generate()` 将请求入队并反复调用 `step()`；每一步调度一批 token，送进同一个 Qwen3 模型，经过 Embedding、多个 Decoder Layer、LM Head 和采样，再更新请求，最后将生成的 token 解码成文本。
+
+### 0. 先固定例子的输入和参数
+
+```python
+from nanovllm import LLM, SamplingParams
+
+llm = LLM(
+    model_path, tensor_parallel_size=1, enforce_eager=True,
+    max_num_batched_tokens=3, max_num_seqs=4,
+)
+params = SamplingParams(temperature=1.0, top_k=2, top_p=0.9, max_tokens=2)
+outputs = llm.generate(["打个招呼", "Say hi"], params, use_tqdm=False)
+```
+
+用很小的预算是为了看清分块，实际部署应根据模型和 GPU 测量后配置。此例使用单 GPU、普通浮点权重、无前缀命中/抢占，关闭 CUDA Graph 重放；`enforce_eager=True` 不意味着取消各层原有的 `torch.compile` 装饰。
+
+为便于跟踪，人为约定以下 tokenizer 和采样结果；它们不是某个真实模型对这些字符串的预测：
+
+| 请求 | 编码后的 prompt | 依次生成的 token | 解码结果 |
+| --- | --- | --- | --- |
+| A | `[11,12,13,14]` | `[101,102]` | 你好 |
+| B | `[21,22]` | `[201,202]` | Hi! |
+
+假设 EOS=2，上述生成 token 都不是 EOS，两个请求均由 `max_tokens=2` 结束。实际 tokenizer 的切分及 token ID 不一定与汉字、单词一一对应。
+
+另假设教学小模型有 2 层，hidden size=16、query heads=2、KV heads=1、head dimension=8、MLP intermediate size=32、词表大小=512，并使用无 QKV bias 的分支。下面用这些尺寸展示数据形状；真实尺寸取自模型目录的配置，不是由上述生成参数设定。
+
+### 1. 初始化：模型、权重、KV 池和调度器
+
+入口 [LLM](nanovllm/llm.py) 直接继承 [LLMEngine](nanovllm/engine/llm_engine.py)，初始化按以下顺序执行：
+
+1. `Config` 读取本地模型配置，验证调度选项，限制最大上下文，并设置 KV 块大小（默认 256）。例如确认一个请求的 prompt 加输出上限不能超过配置允许的长度。
+2. 创建 `ModelRunner`，设置 NCCL 进程组、GPU 和模型浮点 dtype；即便本例 TP=1，当前代码也初始化进程组。TP>1 时另创建 worker 进程。
+3. 构造 [Qwen3ForCausalLM](nanovllm/models/qwen3.py)，再由 [load_model()](nanovllm/utils/loader.py) 从 safetensors 读取权重。Q/K/V 合并加载到 `qkv_proj`，gate/up 合并到 `gate_up_proj`；权重是训练好的参数，不是在每轮生成时重新训练。例如教学模型的 embedding 矩阵形状为 `[512,16]`。
+4. 执行 warmup，测量可用于 KV 的内存，再创建 KV 池，并把每层的 cache 视图交给对应 Attention。池形状为 `[2, layers, blocks, block_size, kv_heads, head_dim]`，开头的 2 表示 K、V。本例每个 token 在每层各保存一个 8 维 K 和一个 8 维 V。
+5. 如未 enforce eager，则准备 decode CUDA Graph；本例跳过。随后加载 tokenizer，记录 EOS，创建 Scheduler/BlockManager；BlockManager 管理池的页编号和引用，而不是另建一套 GPU KV 数据。
+
+模型和 KV 池准备好后，可以重复处理多个请求，不必每次 `generate()` 都重载权重。
+
+### 2. generate：编码输入，构造 Sequence，进入 WAITING
+
+```python
+for prompt, sp in zip(prompts, sampling_params):
+    self.add_request(prompt, sp)
+```
+
+`add_request()` 将字符串交给 tokenizer.encode，检查 token、上下文和总 KV 容量，再构造 Sequence。本地普通 `generate()` 不自动套用聊天模板；HTTP chat 接口会另外调用 `apply_chat_template()`。
+
+入队后的主要状态为：
+
+| 字段 | A | B |
+| --- | --- | --- |
+| token_ids | `[11,12,13,14]` | `[21,22]` |
+| num_prompt_tokens / num_tokens | 4 / 4 | 2 / 2 |
+| num_computed_tokens | 0 | 0 |
+| num_completion_tokens | 0 | 0 |
+| block_table | `[]` | `[]` |
+| status | WAITING | WAITING |
+
+这些状态由 [Sequence](nanovllm/engine/sequence.py) 保存。例如 A 虽然已经知道 4 个 prompt token 的 ID，却还没有它们的 KV，computed 因此为 0，而不是 4。
+
+### 3. 第一轮 step：只计算 A 的前 3 个 tokens
+
+默认 FCFS，整轮预算 3。A 无缓存命中，计划 `[11,12,13]`，预算耗尽，B 暂留 WAITING。A 准入后进入 RUNNING，分配一个 256-token 物理页，假设页号为 0。完整输入准入检查与本轮增量分配分开；这里 A 的 4-token prompt 本身也只需要一页。
+
+`prepare_prefill()` 生成：
+
+```text
+input_ids    = [11,12,13]
+positions    = [0,1,2]
+cu_seqlens_q = [0,3]
+cu_seqlens_k = [0,3]
+slot_mapping = [0,1,2]
+```
+
+第一轮没有历史前缀，Q/K 有效长度都为 3。三条输入经过下面第 4 节中的完整模型计算，每层写入自己的 KV。
+
+模型执行器虽产生一个候选 token，但 `postprocess()` 更新后 A 的 computed=3，小于当前长度 4，候选不追加。此时 A 输出仍为空，B 未计算。`step(stream=True)` 返回空事件；默认 `step()` 也没有已结束请求可返回，统计值为 3。
+
+### 4. 一次模型 forward 内部到底算什么
+
+源码主要位于 [qwen3.py](nanovllm/models/qwen3.py)。用 `T` 表示本轮所有请求拼接后的输入 token 数，前两轮本例都为 T=3。各 token 共享训练好的矩阵，但请求边界限制 Attention 的上下文。
+
+**Embedding：token ID 查表变成向量。**
+
+```python
+hidden_states = self.embed_tokens(input_ids)
+```
+
+矩阵 `E` 为 `[512,16]`，输入 `[11,12,13]` 得到 `E[11]、E[12]、E[13]`，张量从 `[3]` 变为 `[3,16]`。这些是数值向量，还不是文本或预测概率。
+
+**进入每个 Decoder Layer：归一化、Attention、残差、MLP。**
+
+逻辑上可写成以下公式，源码将部分残差相加与下一次 RMSNorm 融合执行，并通过 `residual` 变量传递：
+
+```text
+y = x + Attention(RMSNorm(x))
+z = y + MLP(RMSNorm(y))
+```
+
+例如第一层输入 `[3,16]`，Attention 和 MLP 后仍为 `[3,16]`，供第二层继续计算；各层权重和 KV 不同，不是在同一份 KV 上重复做两遍相同运算。
+
+**Attention 内部：QKV 投影、Q/K Norm、RoPE、缓存和加权求和。**
+
+```text
+输入 [3,16]
+  → qkv_proj 得到 [3,32]
+  → Q:[3,2,8]，K:[3,1,8]，V:[3,1,8]
+  → Q/K 分别做 head 维 RMSNorm（本例 qkv_bias=False）
+  → 根据 positions 对 Q、K 应用 RoPE
+  → 把新 K/V 写入本层缓存
+  → 对各请求执行因果 Attention
+  → 输出 [3,2,8]，展平并经 o_proj 回到 [3,16]
+```
+
+投影维度 32 来自 `2×8 + 1×8 + 1×8`。这是 GQA：两个 query heads 共享一个 KV head，缓存不需要存两份相同的 K/V。RoPE 对 Q/K 编入位置，V 不做这个旋转。Attention 的数学含义为：
+
+```text
+softmax(Q Kᵀ / sqrt(8) + causal_mask) V
+```
+
+例如第一轮位置 2 的查询可读取位置 0、1、2，不能看到尚未计算的位置 3。后续 chunk 通过 KV 页表读取更长的前缀，历史 token 不必再次经过 QKV 投影和 MLP，但当前查询仍需与可见 KV 做 Attention。实际 FlashAttention 内核融合计算，不必显式存下整个 QKᵀ 矩阵。
+
+**MLP：升维、门控激活、降维。**
+
+```python
+gate_up = self.gate_up_proj(x)
+x = self.act_fn(gate_up)  # silu(gate) * up
+x = self.down_proj(x)
+```
+
+本例 `[3,16] → [3,64]`，拆成 gate/up 两份 `[3,32]`，SiLU 门控乘法后仍为 `[3,32]`，down projection 回到 `[3,16]`。它与 Attention 一起逐层变换 token 表示。
+
+**最后 RMSNorm 和 LM Head：向量变成词表分数。**
+
+所有 Decoder Layer 结束后，执行最后的残差相加/RMSNorm。prefill/混合路径再选每个请求最后一个查询位置：
+
+```python
+last_indices = context.cu_seqlens_q[1:] - 1
+x = x[last_indices].contiguous()
+logits = F.linear(x, self.weight)
+```
+
+第一轮只有 A，选输入下标 2，`[3,16] → [1,16] → [1,512]`。512 个 logits 是对下一 token 的分数，不是 512 个生成结果。未完成 prompt 时，当前执行路径也会计算和采样这个候选，随后由 postprocess 忽略。
+
+### 5. 第二轮 step：A 的最后一段和 B 的 prompt 同批计算
+
+A 在 RUNNING，先安排其剩下的 1 token，随后用剩余预算 2 准入 B。B 分配物理页 1。输入为：
+
+```text
+input_ids    = [14,21,22]
+positions    = [ 3, 0, 1]
+cu_seqlens_q = [0,1,3]
+cu_seqlens_k = [0,4,6]
+slot_mapping = [3,256,257]
+```
+
+A 的 Q 长度为 1、K 长度为 4，B 的 Q/K 长度为 2。B 的 K 长度是累计边界的 `6−4=2`，不是 6。block table 为各自的一行页号 `[0]`、`[1]`。每层先写当前 KV，再让 A 的位置 3 看到 A 的 0–3，B 的位置 1 看到 B 的 0–1；两请求不会跨边界互相注意。
+
+模型仍计算 T=3 个输入。LM Head 的 `last_indices=[0,2]`，选择 A 的 14 和 B 的 22 对应的最终表示，得到 `[2,512]` logits，分别用于预测 A、B 的下一 token。
+
+### 6. Sampler：从两行 logits 各取一个 token
+
+顺序为温度缩放、Top-k、Top-p、最终 softmax 和随机采样。本例假设 A 本轮最高三个候选概率为 `[0.6,0.25,0.15]`：k=2 去掉第三项，归一化为约 `[0.706,0.294]`；p=0.9 保留前两项，因为第一项还不够 0.9。随机采样假设抽到 101。B 的那行独立过滤和采样，假设得到 201。实际概率由当前模型 logits 决定，这些数值是示意。
+
+Sampler 返回 `[101,201]` 后，postprocess 按同一请求顺序更新：
+
+| 请求 | 本轮计算后 computed | 追加后的 num_tokens | completion_token_ids | 是否结束 |
+| --- | --- | --- | --- | --- |
+| A | 4 | 5 | `[101]` | 否 |
+| B | 2 | 3 | `[201]` | 否 |
+
+computed 不会因为刚采样出新 token 就立即增加；101、201 还没有作为输入计算过。默认 `step()` 此轮仍不返回完整结果，因为两者都未结束；`step(stream=True)` 则立即返回 `[101]` 和 `[201]` 两条事件。
+
+### 7. 第三轮 step：两个请求一起 decode
+
+现在 A 的 pending 为 `5−4=1`，B 为 `3−2=1`。本轮两个请求都是 decode，走 `prepare_decode()`：
+
+```text
+input_ids    = [101,201]
+positions    = [  4,  2]
+context_lens = [  5,  3]
+slot_mapping = [4,258]
+block_tables = [[0],[1]]
+```
+
+这轮 T=2，Embedding 为 `[2,16]`，每层只为这两个新输入计算 Q/K/V、写入新 KV，再分别读取已有上下文。A 的位置 4 能看到 A 的 0–4；B 的位置 2 能看到 B 的 0–2。不会重新把 `[11,12,13,14]` 或 `[21,22]` 全部送进模型。
+
+纯 decode 不用 prefill 的末位置切片，每条输入本身就是一条请求的最后位置，直接得到 `[2,512]` logits。假设分别采样出 102、202。两请求达到生成上限 2，标记 FINISHED，从 RUNNING 移除并释放页引用。
+
+计算完成时 A 的 computed 为 5，B 为 3，随后 deallocate 将游标重置为 0。A 的完整历史是 `[11,12,13,14,101,102]`，但最后的 102 不再需要计算 KV，因为请求已结束。B 的 202 同理。页回到空闲池，不是删除 GPU KV 池；本例长度未满 256，没有形成可发布的完整前缀缓存块。
+
+### 8. generate 收集完成结果并解码
+
+默认 `step()` 第三轮返回两条完整生成 token 列表，`generate()` 以 seq_id 收集并排序，调用 tokenizer.decode 得到：
+
+```python
+[
+    {"text": "你好", "token_ids": [101, 102]},
+    {"text": "Hi!", "token_ids": [201, 202]},
+]
+```
+
+输出只有生成部分，不包含 prompt。若是遇到 EOS 提前结束，则也会释放缓存；默认本地 decode 如何显示特殊 token 取决于 tokenizer，不能笼统认为所有本地返回文本都自动去掉 EOS。
+
+整个三轮执行可归纳为：
+
+| step | 模型输入 | 本轮追加输出 | 默认 step 返回 | stream=True 返回增量 | num_tokens |
+| --- | --- | --- | --- | --- | --- |
+| 1 | A:`[11,12,13]` | 无 | `[]` | `[]` | 3 |
+| 2 | A:`[14]`、B:`[21,22]` | A:101、B:201 | `[]` | `[101]`、`[201]` | 3 |
+| 3 | A:`[101]`、B:`[201]` | A:102、B:202 | 两条完整结果 | `[102]`、`[202]`，均结束 | -2 |
+
+负值 -2 是纯 decode 的统计标记，不是处理了负数 token。引擎请求都结束后退出 generate 循环；模型实例可继续复用。最终关闭引擎时才调用 ModelRunner.exit，结束通信/worker 等资源。
+
+### 9. 其他配置会改变哪一段
+
+| 配置/场景 | 对上述流程的影响 |
+| --- | --- |
+| 前缀缓存命中 | 从命中的完整 KV 前缀末尾开始安排新查询，少算已经有 KV 的历史。 |
+| 同时存在更长请求 | 按总预算、阈值和队列状态分块；实际每轮输入不一定固定长度。 |
+| KV 不足/请求取消 | 抢占保留输出并重算未缓存历史；取消直接移除请求、释放引用。 |
+| CUDA Graph | eligible 的纯 decode 在 run_model 中重放捕获图；prefill/混合批次走现有变长路径。 |
+| TP>1 | 各 rank 运行权重分片，rank 0 广播执行信息；行并行结果 all-reduce、词表 logits gather，主 rank 采样。 |
+| W8A16 | Attention/MLP 的局部权重分片 INT8 存储、tile 内解量化；激活仍为 16 位，调度与 token 生命周期不变。 |
+| HTTP 流式接口 | 异步后台持续调用 step，并先累计解码再投递事件；路由将新增文本封装为 SSE。 |
+
+调度/状态例子已用真实 LLMEngine、Scheduler、BlockManager 和固定 tokenizer/模型输出替代执行器逐轮核对，确认输入、进度、页号、输出和释放行为。Decoder Layer 的说明对照实际源码给出数学含义与形状，不代表运行了该教学模型的 GPU 前向，也不是对真实模型输出或性能的测量。
