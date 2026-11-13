@@ -528,3 +528,34 @@ count = min(pending, budget, threshold or pending)
 - 不修改生产代码，不声明性能提升；GPU KV 池预分配总量不因增量页管理自动下降。真实 GPU 推理和性能不属于本次文档验证范围。
 - `python -m pytest -q tests/test_scheduler_v1.py tests/test_chunked_prefill.py tests/test_attention_cuda.py`：47 passed / 1 skipped（真实 CUDA Attention 测试）；21 个讲解相对链接有效，`git diff --check` 通过。
 - 提交标题：`docs: explain chunked prefill scheduling and attention`；目标分支：`main`。
+
+## 2026-11-13：补充混合批处理实现讲解
+
+### 需求与修改
+
+用户询问混合批处理的含义和本项目是否实现。按 AGENTS.md，在 `explain.md` 追加独立章节并保留已有主题；本次不修改运行行为。
+
+- `explain.md`：从同一个调度列表、输入拼接、独立 Attention 上下文到逐请求 logits/输出解释现有实现，并链接 Scheduler、ModelRunner、Attention、ParallelLMHead 与测试。
+- `docs/CHANGELOG.md`：追加本次说明和验证记录。
+
+### 核心逻辑与示例
+
+```text
+输入 = A 的 3 个 prefill token + B 的 1 个 decode token
+cu_seqlens_q = [0,3,4]
+cu_seqlens_k = [0,5,12]
+```
+
+示例中 A 已计算 2 tokens、prompt 长 8，B 已计算 6 tokens。解释累计 K 边界中 B 的长度是 7，而非 12；两条请求通过边界和页表各自读取 KV，不会互相看到上下文。
+
+```python
+last_indices = context.cu_seqlens_q[1:] - 1
+```
+
+下标 `[2,3]` 为 A、B 分别提取候选。postprocess 后 A 仅推进到 5/8，不产生正式输出；B 追加一个新 token，因此流式结果只包含 B。区分同批 forward 与独立 CUDA stream/分离部署，并说明混合不保证每轮发生或完全隔离延迟。
+
+### 验证与版本信息
+
+- 对照当前调度、模型输入、Attention、LM Head 与输出代码核对文档；教学 token ID 不代表模型预测，不宣称 GPU 并行度或性能收益。
+- 运行混合调度、实际输入准备/TP 状态和 RUNNING 顺序三项相关测试，结果 3 passed；讲解中的 28 个相对链接有效，`git diff --check` 通过。GPU 传输在输入准备测试中替换为 CPU，未进行真实 GPU 性能验证。
+- 提交标题：`docs: explain mixed prefill and decode batching`；目标分支：`main`。

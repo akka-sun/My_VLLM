@@ -272,3 +272,65 @@ outputs = llm.generate([long_prompt, short_prompt], SamplingParams(max_tokens=32
 512 限制整批本轮工作量；多个请求同时存在时，128 限制单请求占用的 token 数量，不是把 prompt 预先切成固定大小字符串。分块以 token 为单位，实际长度还取决于缓存命中、剩余预算和剩余历史。
 
 相关测试见 [test_scheduler_v1.py](tests/test_scheduler_v1.py)、[test_chunked_prefill.py](tests/test_chunked_prefill.py) 和 [test_attention_cuda.py](tests/test_attention_cuda.py)。它们分别覆盖状态/分配/抢占、混合输入与分块 Attention 参考数值、可选真实 GPU Attention。CPU 参考测试不等同于真实 GPU 性能验证。
+
+## 混合批处理：prefill 和 decode 如何放进同一轮
+
+**混合批处理就是同一次模型执行中，既包含某些请求的 prefill chunk，也包含另一些请求的 decode token。当前项目已实现。** 多个请求全在 decode 只是普通的多请求批处理；这里的“混合”特指同批包含不同计算阶段。
+
+例如本轮预算 4，选择 A 的 3 个 prompt token 和 B 的 1 个 decode token，合成 4-token 输入后运行一次模型，不必等 A 的整个 prompt 完成才继续 B。A、B 是不同请求；同一请求仍须先计算完自己的 prompt，才能开始生成答案。
+
+### 1. 调度器将两类请求加入同一个列表
+
+源码：[Scheduler.schedule()](nanovllm/engine/scheduler.py)。RUNNING 包含部分 prefill 和 decode，两者都按 pending token 数计算本轮工作量，准入的新请求也加入同一个 `scheduled_seqs`。
+
+```python
+seq.num_scheduled_tokens = count
+scheduled_seqs.append(seq)
+# 返回整批及执行路径标记
+return scheduled_seqs, any(seq.is_prefill for seq in scheduled_seqs)
+```
+
+例如本轮 `seqs=[A,B]`，对应计划数为 `[3,1]`。只要 A 需要变长路径，整批标记为 True；这不改变 B 的请求状态，也不是把 B 的完整历史重新计算一次。RUNNING 保持入场顺序，混合能否形成仍取决于 token 预算、活动槽位、KV 容量和阈值；不能保证每轮都混合。
+
+### 2. 拼接输入，同时保留各自的请求边界
+
+源码：[ModelRunner.prepare_prefill()](nanovllm/engine/model_runner.py)。假设 A 已计算前 2 个 token、prompt 总长 8，B 的前 6 个 token 已有 KV：
+
+| 请求 | 本轮输入 token ID | 位置 | Q 长度 | 有效 K/V 总长度 |
+| --- | --- | --- | --- | --- |
+| A：prefill | `[12,13,14]` | `[2,3,4]` | 3 | 5 |
+| B：decode | `[27]` | `[6]` | 1 | 7 |
+
+这些 ID 仅用于教学。模型执行器合成：
+
+```text
+input_ids    = [12,13,14,27]
+positions    = [ 2, 3, 4, 6]
+cu_seqlens_q = [0,3,4]
+cu_seqlens_k = [0,5,12]
+```
+
+`cu_seqlens_q` 表示前三个查询属于 A，第四个查询属于 B；`cu_seqlens_k` 中 5、12 是累计边界，B 的实际 K 长度为 12−5=7，不是 12。两条请求还有各自的 block table，slot mapping 分别指定新 KV 的写入位置。例如页大小 256，A 使用物理页 2、B 使用页 5，新 KV 分别写入 `[514,515,516]` 和 `[1286]`。
+
+### 3. 共用模型计算，但 Attention 上下文独立
+
+源码：[ModelRunner.run()](nanovllm/engine/model_runner.py) 和 [Attention.forward()](nanovllm/layers/attention.py)。`LLMEngine.step()` 对整批调用一次 `run`；线性层、MLP 等对拼接后的 token 张量执行批量运算。混合批次使用变长 Attention，按请求边界与 block table 读取 KV。
+
+在上例中，A 的位置 4 只看 A 的位置 0–4，B 的位置 6 只看 B 的位置 0–6。虽然输入扁平拼接，B 不会因此看见 A 的 prompt。批处理共享模型权重，不表示请求之间混合上下文；相同前缀的显式缓存复用是另一项独立机制。
+
+同批执行也不意味着两条独立 CUDA stream 必然同时运行。当前项目是一个混合 forward，并没有为 prefill/decode 建立独立 GPU 流水线或分离部署。较大的 prefill chunk 仍可能延长本轮时间，从而影响 decode 的 token 间隔；分块预算用于控制每轮工作量，不提供性能隔离。
+
+### 4. 每个请求分别取候选、更新和返回
+
+源码：[ParallelLMHead.forward()](nanovllm/layers/embed_head.py) 和 `Scheduler.postprocess()`。
+
+```python
+last_indices = context.cu_seqlens_q[1:] - 1
+x = x[last_indices].contiguous()
+```
+
+上例的下标为 `[2,3]`，分别取 A 的最后一个查询和 B 的查询，得到两条请求的 logits，再各自采样。A 虽然输入 3 tokens，但这一步不会产生 3 个回答 token。
+
+随后 A 的 computed 从 2 变为 5，尚未追上长度 8，其候选忽略；B 的 computed 从 6 变为 7，已追上当前历史，可追加候选 28。于是本轮 `step(stream=True)` 只返回 B 的新增 `[28]`。等 A 完成最后一个 prompt chunk，才返回 A 的第一个新 token。
+
+实现与验证入口分别是 [混合调度测试](tests/test_chunked_prefill.py)、[统一进度与运行顺序测试](tests/test_scheduler_v1.py)。其中 `test_mixed_tp_batch_builds_positions_slots_and_full_context` 调用实际输入准备代码，验证混合输入、位置、slot、Q/K 边界和 TP decode 序列；本机测试替换 GPU 传输，不代表真实 GPU 并发或性能实测。
