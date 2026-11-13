@@ -76,7 +76,8 @@ class BlockManager:
 
     def allocate_slots(self, seq: Sequence, num_new_tokens: int,
                        computed_blocks: list[int] | None = None, *,
-                       full_sequence_must_fit: bool = False) -> list[int] | None:
+                       full_sequence_must_fit: bool = False,
+                       lookahead: int = 0) -> list[int] | None:
         """Allocate only through this step's end; failure has no side effects.
 
         The full-sequence gate checks admission capacity without allocating
@@ -89,7 +90,7 @@ class BlockManager:
             raise ValueError("prefix adoption requires an unallocated sequence")
         computed = len(computed_blocks) * self.block_size if computed_blocks else seq.num_computed_tokens
         end = computed + num_new_tokens
-        if end > seq.num_tokens:
+        if lookahead < 0 or end > seq.num_tokens + lookahead:
             raise ValueError("scheduled tokens exceed sequence length")
         existing = len(seq.block_table) + len(computed_blocks)
         num_new_blocks = max(0, (end + self.block_size - 1) // self.block_size - existing)
@@ -113,6 +114,20 @@ class BlockManager:
         seq.block_table.extend(new_blocks)
         seq.num_computed_tokens = computed
         return new_blocks
+
+    def truncate(self, seq: Sequence):
+        """Discard lookahead pages. Stale KV inside the tail is unreachable.
+
+        Only verified full pages are ever hashed, so truncation cannot leave
+        speculative token hashes available to another request.
+        """
+        keep = (seq.num_computed_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > keep:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

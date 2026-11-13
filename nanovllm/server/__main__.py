@@ -1,4 +1,5 @@
 import argparse
+import json
 
 
 def main():
@@ -19,6 +20,8 @@ def main():
     parser.add_argument('--max-pending-requests', type=int, default=256)
     parser.add_argument('--quantization', choices=['int8'], default=None)
     parser.add_argument('--enforce-eager', action='store_true')
+    parser.add_argument('--speculative-config', type=json.loads, default=None,
+                        help='JSON: method (draft_model/dspark), local model, num_speculative_tokens')
     args = parser.parse_args()
     try:
         import uvicorn
@@ -29,7 +32,7 @@ def main():
         'tensor_parallel_size', 'max_model_len', 'max_num_batched_tokens', 'max_num_seqs',
         'gpu_memory_utilization', 'quantization', 'enforce_eager', 'scheduling_policy',
         'long_prefill_token_threshold', 'long_prefill_token_threshold_adaptive',
-        'scheduler_reserve_full_isl')}
+        'scheduler_reserve_full_isl', 'speculative_config')}
     app = create_app(args.model, served_model_name=args.served_model_name,
         engine_kwargs=options, max_pending_requests=args.max_pending_requests)
     # One HTTP worker owns the engine and its tensor-parallel subprocesses.

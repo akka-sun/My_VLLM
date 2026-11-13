@@ -31,6 +31,16 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config, quantization=config.quantization)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.drafter = None
+        self.draft_cache_reserve = 0
+        if config.speculative_config:
+            from nanovllm.engine.drafters import create_drafter, IndependentDrafter
+            self.drafter = create_drafter(config, self.model)
+            if isinstance(self.drafter, IndependentDrafter):
+                dc = self.drafter.model.config
+                dim = getattr(dc, 'head_dim', dc.hidden_size // dc.num_attention_heads)
+                self.draft_cache_reserve = (2 * dc.num_hidden_layers * dc.num_key_value_heads
+                    * dim * config.max_num_seqs * config.max_model_len * hf_config.dtype.itemsize)
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -98,6 +108,26 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
+        if self.drafter is not None:
+            # Profile draft workspace before spending the remaining memory on
+            # target KV. Independent first-use prefill can span the full prefix.
+            from nanovllm.engine.drafters import IndependentDrafter
+            with torch.inference_mode():
+                if isinstance(self.drafter, IndependentDrafter):
+                    output = self.drafter.model(
+                        input_ids=torch.zeros((1, max_model_len), dtype=torch.long),
+                        use_cache=True, logits_to_keep=1)
+                    del output
+                else:
+                    c = self.drafter.model.config
+                    count = min(self.config.speculative_config['num_speculative_tokens'], max_model_len - 1)
+                    query_count = count + (not c.get('sample_from_anchor', True))
+                    context_length = max_model_len - query_count
+                    ids = torch.full((query_count,), c['mask_token_id'], dtype=torch.long)
+                    hidden = self.drafter.model.block(
+                        torch.zeros_like(self.drafter.context[0, :context_length]), ids, context_length)
+                    logits = self.drafter.model.lm_head(hidden)
+                    del hidden, logits
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -110,8 +140,10 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current
+                                        - self.draft_cache_reserve) // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise ValueError('No memory remains for target KV; reduce max_num_seqs/max_model_len or draft model size')
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -223,12 +255,21 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        if getattr(self, 'drafter', None) is not None and all(seq.block_table for seq in seqs):
+            from nanovllm.engine.speculative_runner import run_speculative
+            return run_speculative(self, seqs)
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         sampling_tensors = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, *sampling_tensors).tolist() if self.rank == 0 else None
+        if getattr(self, 'drafter', None) is not None:
+            self.model.model.aux_hidden_states = None
         reset_context()
         return token_ids
+
+    def retain_requests(self, seq_ids):
+        if self.drafter is not None:
+            self.drafter.retain(set(seq_ids))
 
     @torch.inference_mode()
     def capture_cudagraph(self):

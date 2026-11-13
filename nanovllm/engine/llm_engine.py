@@ -72,16 +72,26 @@ class LLMEngine:
 
     def abort_request(self, seq_id: int) -> bool:
         """Remove a queued/active request and release its KV cache pages."""
-        return self.scheduler.abort(seq_id)
+        aborted = self.scheduler.abort(seq_id)
+        if aborted and getattr(getattr(self, 'config', None), 'speculative_config', None):
+            self.model_runner.call('retain_requests', [s.seq_id for s in self.scheduler.running])
+        return aborted
 
     def step(self, stream: bool = False):
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
             return [], 0
-        previous_lengths = [seq.num_completion_tokens for seq in seqs] if stream else []
+        previous_lengths = [seq.num_completion_tokens for seq in seqs]
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        speculative = getattr(getattr(self, 'config', None), 'speculative_config', None)
+        if speculative:
+            self.model_runner.call('retain_requests', [s.seq_id for s in self.scheduler.running])
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if speculative:
+            self.model_runner.call('retain_requests', [s.seq_id for s in self.scheduler.running])
+        if not is_prefill:
+            num_tokens = -sum(seq.num_completion_tokens - previous for seq, previous in zip(seqs, previous_lengths))
         if stream:
             outputs = [
                 {"seq_id": seq.seq_id, "token_ids": seq.completion_token_ids[previous_length:],

@@ -608,3 +608,94 @@ HTTP 请求 → 参数校验与入队 → 后台 step(stream=True) → JSON 或 
 - 用实际 CPU 量化函数核对 W8A16 示例，另用 PyTorch 整数运算核对 W8A8 教学示例的点积为 0。检查 `explain.md` 中 40 个源码链接及 Git 差异。
 - 使用临时依赖目录中的 Transformers 4.51.3 和 HTTP 测试依赖运行 `python -m pytest -q -rs tests/test_quantization.py tests/test_api.py`，结果为 20 项通过、6 项跳过。跳过的 CUDA 量化测试需要 Triton。未加载真实模型进行端到端推理或测量性能。
 - 提交标题为 `docs: explain W8A16 quantization and compatible API serving`，目标分支为 `origin/main`。
+
+## 2026-11-13：Speculative Decoding（独立小模型与 DSpark）
+
+### 已确认设计与实现计划
+
+用户已确认以现有 Qwen3 为目标，增加 `speculative_config`，两种 drafter 共用目标模型多位置验证、拒绝采样、KV 回滚、停止与流式输出。按本仓库约定，设计、计划与验证统一记录在本文件，不新增独立说明文件。
+
+1. [x] 先验证采样概率变换、拒绝与 bonus token、EOS/长度裁剪以及跨页回滚。
+2. [x] 调度器预留 lookahead 查询预算和私有 KV 页；只提交接受的前缀，不缓存未确认的页哈希。
+3. [x] 独立 Qwen3 小模型使用 Transformers KV cache；DSpark 使用 dense Qwen3 并行块、低秩 Markov 与置信度头，严格加载权重。
+4. [x] 接通配置、目标多位置 logits / 辅助层特征、引擎与服务入口；首版推测模式单 GPU、eager，不支持的模型/配置提前拒绝。
+5. [x] 验证完整测试集、真实张量 CPU/CUDA 路径和可用的集成路径；记录未验证限制。提交后按授权普通推送 `origin/main`，实际推送结果在最终回复报告。
+
+重点检查：首位拒绝、全部接受、跨页且共享 prefix、抢占后重算、EOS 出现在块内、剩余输出不足一块、混合 prefill/decode、过滤后的 p/q 分布、DSpark 的 anchor/fill-in 两种布局和不完整 checkpoint。
+
+实现选择：DSpark 先提供 PyTorch SDPA 参考执行，不引入 vLLM 依赖；目标验证仍使用 Nano-vLLM 的 paged Attention。性能必须实测，不把结构实现等同于加速。
+
+### 主体修改、代表性代码与示例
+
+**配置与入口**：`nanovllm/config.py` 新增 `speculative_config` 和校验；`server/__main__.py` 新增 JSON 参数；README 提供两种本地权重的 Python/服务启动示例。未配置时继续普通解码。推测模式要求 Qwen3、单 GPU，自动启用 eager；同时兼容 Transformers 4.51 的 `torch_dtype` 与新版 `dtype`。
+
+```python
+speculative_config={
+    "method": "draft_model",  # 或 dspark
+    "model": "/models/local-draft",
+    "num_speculative_tokens": 5,
+}
+```
+
+例如 Qwen3-4B 目标配 Qwen3-0.6B 独立草稿，要求两者 tokenizer token 映射完全一致。DSpark 则加载与目标匹配的训练 checkpoint；普通 Qwen3 小模型不能代替 DSpark 权重。
+
+**概率与验证**：`engine/speculative.py` 提供 `probabilities()`、`verify()`、`verification_length()` 与 `SpeculativeResult`；`layers/sampler.py` 和 `sampling_params.py` 增加原生 `temperature=0` 贪心模式，保留原有正温度下限。目标和草稿都按 temperature → Top-k → Top-p 形成分布。
+
+```python
+accept_probability = min(1, p[token] / q[token])
+correction_distribution = normalize(clamp_min(p - q, 0))
+```
+
+例如草稿 `[4,5,6]` 的前两项被接受、第三项拒绝，则只提交 `[4,5,纠正token]`；全部接受则追加一个目标分布的 bonus token。5000 次随机首 token 抽样检验目标概率 `[0.2,0.8]`，避免仅用贪心测试证明随机正确性。无损指分布一致，不保证相同 seed 的字符串相同。
+
+**目标执行与辅助特征**：`engine/speculative_runner.py` 拼接各请求的 anchor+草稿为一次 ragged 目标前向；`models/qwen3.py` 按配置提取目标层输出特征；`layers/embed_head.py` 增加 `all_tokens`，只为验证位置和普通 prefill 的最后位置计算 logits，避免为整段 prompt 展开词表。
+
+```text
+A：anchor + 3 个草稿，B：2 个 prefill token
+目标输入：A 的 4 个查询 + B 的 2 个查询
+logits：A 的 4 个位置 + B 的最后位置
+```
+
+每条请求仍通过自己的 Q/K 边界和页表读取上下文。B 未完成 prompt 时仅推进 computed cursor，不输出猜测 token。
+
+**独立草稿**：`engine/drafters.py::IndependentDrafter` 使用真实 Transformers Qwen3、SDPA 与每请求 DynamicCache，`logits_to_keep=1` 限制草稿 prefill 的 logits 内存。下一轮按正式历史裁剪草稿 KV，再送入纠正/bonus token。
+
+```python
+cache.crop(min(cache.get_seq_length(), len(seq) - 1))
+```
+
+例如原前缀 `[1,2,3]` 起草 `[4,5,6]`，首项被拒绝、正式追加 `7`，下一轮先裁剪到 `[1,2,3]` 的 KV，再计算 `7`；缓存中的 `4,5` 不会被继续使用。完成、取消、抢占都通过 `retain_requests()` 清理草稿状态。
+
+**DSpark**：`models/dspark.py` 实现 full non-causal Qwen3 block、目标特征投影/RMSNorm、低秩 `MarkovHead` 和 float32 置信度投影；`DSparkDrafter` 管理每请求投影上下文、顺序 Markov 采样和验证长度。支持 native Qwen3DSparkModel 与嵌套 transformer_layer_config 格式，以及 anchor-first / fill-in 布局。
+
+```text
+target aux → fc → projected context
+anchor + masks → 并行 block hidden
+base logits + W2(W1(previous_token)) → 下一个草稿 token
+```
+
+例如 3 个位置的 backbone 仅前向一次，位置 2 的 Markov bias 使用位置 1 实际采样 token。若 `d2t=[0,2,3,5]`，按 offset 语义映射为目标 token `[0,3,5,8]`，其余目标词表概率为 0。loader 校验所有必需权重/形状，允许按契约共享 embedding / full LM head，忽略训练 `t2d` 与未使用 `mask_embedding`；缺失 confidence/Markov、缺失 reduced-vocab 映射或未知权重明确报错。
+
+**验证长度与审查修正**：以各位置置信度的累积乘积估算前缀存活率，选择期望提交数/周期成本最大的长度。可提供 N+1 项实测 `verification_costs`；默认成本为未经校准的 `1 + k * batch_size / max_num_batched_tokens`，不声称是 vLLM 的实测成本模型。
+
+审查发现“根据随机草稿的 Markov 置信度截断，再用原 q 拒绝采样”会造成选择偏差，故置信度调度改用独立的确定性 greedy pilot 前驱链。实际草稿 q 仍由实际随机前驱计算。例：相同上下文换随机种子，草稿可改变，但用于长度选择的置信度保持相同；回归测试先失败、修正后通过。另一个先红后绿的回归覆盖含 `mask_embedding` 的有效 checkpoint。
+
+**调度、缓存与输出**：`engine/scheduler.py` 预留 lookahead 和查询预算，内存不足时先缩短草稿再考虑抢占；`block_manager.py` 增加 lookahead 分配与 `truncate()`；`sequence.py` 记录本轮草稿上限；`llm_engine.py` 返回多 token 流式增量，decode 统计使用实际提交 token 数。
+
+```python
+num_computed_tokens += len(committed_tokens)
+# 最后一个纠正/bonus token 尚未前向，仍保持 pending
+```
+
+例如原长度 L、computed=L-1，提交 3 个输出后 computed=L+2、正式长度 L+3；未接受的页被回收，页内陈旧 KV 因长度不可达。只对接受且计算完的整页发布 prefix hash。块内遇 EOS 或达到 max_tokens 立即截断，完成/取消释放所有页。DSpark 禁用 KV-only prefix hit，以便完整重算辅助特征；其他调度/普通解码保持原路径。
+
+**内存与限制**：`model_runner.py` 在分配目标 KV 前加载草稿权重、预留 DSpark 投影上下文，profile 草稿 workspace；独立草稿额外按 `max_num_seqs * max_model_len` 预留 KV 容量。若无目标 KV 空间，提示降低并发、上下文或草稿大小。DSpark 当前每轮重投影上下文 K/V，没有 vLLM fused kernel / draft CUDA graph。recurrent Markov、sliding attention、scaled/interleaved RoPE、量化 draft 与 TP 推测均不支持；目标原有 W8A16 路径保留。
+
+### 验证与版本信息
+
+- `tests/test_speculative.py`：分布变换、接受/拒绝/bonus、随机分布、EOS、页回滚、预算、内存压力/抢占、参数与 dtype 校验、DSpark non-causal/context 依赖（CPU/CUDA）。
+- `tests/test_drafters.py`：真实随机初始化小型 Qwen3 的缓存裁剪（CPU/CUDA），DSpark 两种布局、权重 roundtrip/缺失头、reduced-vocab 映射、pilot 独立性。
+- `tests/test_speculative_integration.py`：实际 Nano-vLLM Qwen3 权重加载、前向、辅助特征、调度与流式结果，在仅 4 页、每页 4 token 的容量下实际触发抢占重算，对比同一小型 Transformers Qwen3 的逐 token 贪心输出。仅将不可用的 GPU Attention 内核替换为参考 paged SDPA，并将输入传输留在 CPU；不冒充原生 GPU 服务测试。
+- 完整测试命令 `python -m pytest -q -rs`：113 passed、7 skipped；跳过项为 1 个真实 paged Attention 和 6 个 CUDA 量化测试，原因是本机缺少 Triton/FlashAttention。CUDA Qwen3 SDPA 发出未编译 Flash Attention 的警告，实际使用 PyTorch 可用后端。
+- 环境：Windows，PyTorch 2.3.1+cu118，RTX 3060 Laptop 6GB；临时 PYTHONPATH 提供 Transformers 4.51.3 与 HTTP 测试依赖，未修改全局环境。该 PyTorch 低于项目声明的 >=2.4；实际 Linux NCCL/Triton/FlashAttention 服务、公开训练 DSpark 大权重、端到端速度/接受率均未验证，不宣称性能收益。
+- 提交标题：`feat: add independent draft and DSpark speculative decoding`；目标分支：`origin/main`。文档包含与上游 vLLM 模型/采样接口及 DSpark 论文的参考链接（见 README）。

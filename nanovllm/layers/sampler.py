@@ -7,7 +7,9 @@ class Sampler(nn.Module):
     @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor,
                 top_ks: torch.Tensor | None = None, top_ps: torch.Tensor | None = None):
-        logits = logits.float() / temperatures.unsqueeze(dim=1)
+        greedy = temperatures == 0
+        greedy_tokens = logits.argmax(dim=-1)
+        logits = logits.float() / temperatures.masked_fill(greedy, 1).unsqueeze(dim=1)
         if top_ks is not None or top_ps is not None:
             sorted_logits, indices = logits.sort(dim=-1, descending=True)
             if top_ks is not None:
@@ -25,4 +27,4 @@ class Sampler(nn.Module):
             logits = torch.empty_like(logits).scatter_(1, indices, sorted_logits)
         probs = torch.softmax(logits, dim=-1)
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
-        return sample_tokens
+        return torch.where(greedy, greedy_tokens, sample_tokens)

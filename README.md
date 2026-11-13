@@ -230,6 +230,99 @@ run `python -m pytest -q`. GPU kernel tests skip when CUDA/Triton/FlashAttention
 are unavailable. The HTTP tests use the real engine scheduler with deterministic
 model execution; they do not establish real model performance or quality.
 
+## Speculative Decoding
+
+Two optional Qwen3 proposal methods share the same target verification and
+rejection sampler. With no `speculative_config`, the original execution path
+is used. Speculation currently requires **one GPU** and automatically selects
+eager execution. It works with chunked prefill, request priority, streaming,
+preemption and cancellation.
+
+**Independent small model** (local Qwen3 safetensors checkpoints and identical
+target/draft tokenizer mappings):
+
+```python
+from nanovllm import LLM, SamplingParams
+
+llm = LLM(
+    "/models/Qwen3-4B",
+    max_num_seqs=4,
+    max_num_batched_tokens=512,
+    speculative_config={
+        "method": "draft_model",
+        "model": "/models/Qwen3-0.6B",
+        "num_speculative_tokens": 5,
+    },
+)
+outputs = llm.generate(["Explain speculative decoding."],
+                       SamplingParams(temperature=0, max_tokens=128))
+```
+
+The small model uses Transformers SDPA with per-request KV caches. Rejected
+suffixes are cropped before the next proposal. Use Transformers >=4.51 with
+Qwen3 support, alongside the project's usual Linux CUDA/Triton/FlashAttention
+runtime. A zero temperature selects greedy decoding; positive temperatures
+use temperature, Top-k and Top-p for both proposal and target distributions.
+Random sampling preserves the target distribution, not a seed-identical string.
+
+**DSpark** (a trained DSpark draft checkpoint matched to the target):
+
+```python
+llm = LLM(
+    "/models/Qwen3-4B",
+    max_num_seqs=4,
+    max_num_batched_tokens=512,
+    speculative_config={
+        "method": "dspark",
+        "model": "/models/dspark_qwen3_4b_block7",
+        "num_speculative_tokens": 7,
+    },
+)
+```
+
+The DSpark path implements the parallel non-causal Qwen3 block backbone,
+low-rank Markov token transitions and trained confidence head using PyTorch
+SDPA. It supports native `Qwen3DSparkModel` config and Speculators configs with
+`transformer_layer_config`, full or pruned draft vocabulary (`d2t` offsets),
+and anchor-as-first / fill-in layouts. Checkpoint tensor names and shapes are
+validated; missing Markov/confidence weights fail at startup. Recurrent Markov
+heads, sliding attention, scaled/interleaved RoPE and quantized draft weights
+are explicitly unsupported. The optional `int8` target path still applies only
+to target weights. No model weights are included in this repository.
+
+DSpark stores projected target auxiliary features per active request and
+recomputes their context K/V for each proposal. Target prefix-cache reuse is
+disabled for DSpark because KV-only cache hits lack these features. This is
+an eager reference implementation, without vLLM's fused draft kernels or CUDA
+graphs; no end-to-end speedup has been established.
+
+Confidence scheduling uses a deterministic greedy pilot chain, independent of
+the stochastic proposal, to avoid selection bias in rejection sampling. By
+default, verification costs use an **uncalibrated**, concurrency-dependent
+estimate `cost[k] = 1 + k * batch_size / max_num_batched_tokens`. For a measured
+load/hardware configuration, supply `verification_costs=[c0, ..., cN]`, where
+`ck` is the positive measured total cycle cost of verifying the anchor plus
+`k` draft tokens. Length is chosen to maximize expected committed tokens per
+cost; `k=0` falls back to ordinary target sampling. The scheduler may shorten
+blocks further to fit the token budget, remaining output or free KV pages.
+
+Draft weights and DSpark context storage are allocated before sizing target
+KV. Independent draft KV capacity is also reserved for
+`max_num_seqs * max_model_len`; choose those limits to fit **both** models.
+EOS/output limits stop within accepted blocks, and rejected lookahead pages
+are released without publishing their prefix hashes.
+
+The API server accepts the same JSON configuration:
+
+```bash
+nanovllm-serve --model /models/Qwen3-4B --max-num-seqs 4 \
+  --speculative-config '{"method":"dspark","model":"/models/dspark_qwen3_4b_block7","num_speculative_tokens":7}'
+```
+
+References: [vLLM speculative decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/),
+[Qwen3 DSpark model contract](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_dspark.py),
+[DSpark paper](https://arxiv.org/abs/2607.05147).
+
 ## Benchmark
 
 See `bench.py` for benchmark.

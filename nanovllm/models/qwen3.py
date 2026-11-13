@@ -179,6 +179,8 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config, quantization) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.aux_layer_ids = ()
+        self.aux_hidden_states = None
 
     def forward(
         self,
@@ -187,8 +189,13 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        auxiliary = {}
+        for index, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if index in self.aux_layer_ids:
+                auxiliary[index] = hidden_states + residual
+        self.aux_hidden_states = (torch.cat([auxiliary[i] for i in self.aux_layer_ids], dim=-1)
+                                  if self.aux_layer_ids else None)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -223,5 +230,6 @@ class Qwen3ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        all_tokens: bool = False,
     ) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states, all_tokens=all_tokens)
