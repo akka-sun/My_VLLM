@@ -468,3 +468,33 @@ seq.completion_token_ids[previous_length:]
 
 - 验证通过。检查了 Markdown 相对链接和 Git 差异，并运行 `python -m pytest -q tests/test_streaming.py tests/test_api.py`（HTTP 测试依赖安装到临时目录，设置 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` 和 `USE_TF=0`），结果为 16 项通过，2 条环境依赖弃用警告。覆盖本地迭代、HTTP SSE 和断开连接清理，未执行真实模型端到端推理。
 - 提交标题为 `docs: explain token streaming and record walkthrough convention`，目标分支为 `origin/main`。
+
+## 2026-11-13：按代码讲解约定补充 step 与 Top-k / Top-p
+
+### 需求与修改
+
+用户要求参考 AGENTS.md 更新项目实现讲解。现有约定要求统一写入根目录 `explain.md`，因此保留已有流式输出章节，追加本次聊天涉及的 `step()` 和采样主题；无需修改已经存在的约定。
+
+- `explain.md`：按参数入口、关键调用、状态/张量变化、输出的顺序解释实现，展示代表性代码块，每段配小输入；链接到实际源码和已有测试。
+- `docs/CHANGELOG.md`：追加本次文档更新记录。
+
+### 关键约定与示例
+
+```text
+入口与调用顺序 → 关键代码段 → 数据变化 → 简单例子 → 返回结果与限制
+```
+
+step 章节用 5-token prompt、预算 3、生成上限 2 的例子走完中间 chunk、首个输出和 decode，说明候选 token 何时真正追加、流式与默认返回值的差异，以及 num_tokens 统计符号。对应关键逻辑为 `schedule → run → postprocess → 返回结果`。
+
+```python
+remove = previous >= top_p
+```
+
+这是 Top-p 判断的简化示意，完整代码和保护条件在讲解中列出。用概率 `[0.5,0.3,0.15,0.05]` 解释为何 p=0.7 保留 A、B；再说明 k=2 后归一化到 `[0.625,0.375]`，叠加 p=0.6 只保留 A。最后解释 scatter 恢复 token ID、指数噪声随机采样，而非直接取最大概率。
+
+### 验证与版本信息
+
+- 对照现有 LLMEngine、Scheduler、ModelRunner、Sampler 和 SamplingParams 核对调用、参数和边界语义；检查新增 Markdown 相对链接、差异及代码片段。
+- 本次只更新说明，不修改推理行为；教学概率和 token ID 不是模型实测，不声称性能提升。真实 GPU 推理不在本次验证范围。
+- `python -m pytest -q tests/test_sampling.py tests/test_streaming.py`：19 passed / 2 skipped；跳过 CUDA 相关测试。`explain.md` 的 13 个相对链接全部有效，`git diff --check` 通过。
+- 提交标题：`docs: explain inference steps and top-k top-p sampling`；目标分支：`main`。
