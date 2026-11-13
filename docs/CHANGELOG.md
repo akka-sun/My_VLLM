@@ -592,3 +592,19 @@ Embedding → RMSNorm → QKV/Norm/RoPE → KV/Attention → O projection
 - 核对实际 Qwen3、RMSNorm、RoPE、SiluAndMul、ParallelLMHead、加载与 KV 初始化源码。没有加载真实权重、运行教学 Transformer GPU 前向或测量性能，不宣称示例为模型实测预测。
 - `python -m pytest -q tests/test_streaming.py tests/test_chunked_prefill.py`：13 passed；讲解的 34 个相对链接有效，`git diff --check` 通过。
 - 提交标题：`docs: walk through end-to-end inference with two requests`；目标分支：`main`。
+
+## 2026-11-13：讲解 W8A16 量化与 OpenAI 兼容服务
+
+用户希望结合代码理解量化和兼容 API 的实现。在 `explain.md` 追加两节，讲解权重加载、矩阵乘法和 HTTP 请求如何进入同一个推理引擎，并用计算示例说明扩展 W8A8 所需的激活量化。
+
+- `nanovllm/utils/loader.py` 的 `load_model()` 与 `nanovllm/layers/linear.py` 的 `_copy_weight()` 将浮点权重分片交给 `quantize_weight()`。例如权重行 `[0.5, -1]` 存为 `[64, -127]` 和系数 `1/127`。Triton 内核逐块乘回系数后与 16 位激活做矩阵乘法；激活 `[2, 1]` 的 CPU 参考输出是 `0.0078125`。
+- `nanovllm/server/__main__.py` 启动服务，`app.py` 的 `respond()` 校验并接收请求，`async_engine.py` 的 `_run()` 调用 `step(stream=True)` 并按请求分发事件。聊天示例假设生成「你」「好」，流式响应发两个文本增量，普通响应一次返回「你好」。
+
+```text
+浮点分片 → INT8 权重 + 每行系数 → 逐块解量化 → 16 位矩阵乘法
+HTTP 请求 → 参数校验与入队 → 后台 step(stream=True) → JSON 或 SSE
+```
+
+- 用实际 CPU 量化函数核对 W8A16 示例，另用 PyTorch 整数运算核对 W8A8 教学示例的点积为 0。检查 `explain.md` 中 40 个源码链接及 Git 差异。
+- 使用临时依赖目录中的 Transformers 4.51.3 和 HTTP 测试依赖运行 `python -m pytest -q -rs tests/test_quantization.py tests/test_api.py`，结果为 20 项通过、6 项跳过。跳过的 CUDA 量化测试需要 Triton。未加载真实模型进行端到端推理或测量性能。
+- 提交标题为 `docs: explain W8A16 quantization and compatible API serving`，目标分支为 `origin/main`。

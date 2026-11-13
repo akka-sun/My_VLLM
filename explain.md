@@ -566,3 +566,46 @@ block_tables = [[0],[1]]
 | HTTP 流式接口 | 异步后台持续调用 step，并先累计解码再投递事件；路由将新增文本封装为 SSE。 |
 
 调度/状态例子已用真实 LLMEngine、Scheduler、BlockManager 和固定 tokenizer/模型输出替代执行器逐轮核对，确认输入、进度、页号、输出和释放行为。Decoder Layer 的说明对照实际源码给出数学含义与形状，不代表运行了该教学模型的 GPU 前向，也不是对真实模型输出或性能的测量。
+
+## W8A16 权重量化
+
+W8A16 中的 W 指线性层权重，A 指送进线性层的激活值。仓库用 `quantization="int8"` 启用 W8A16。权重以 INT8 保存，激活仍是 FP16 或 BF16。W8A8 还需要把激活量化为 8 位，本仓库当前只提供 W8A16。
+
+1. **初始化。** `LLM(..., quantization="int8")` 或服务启动参数 `--quantization int8` 把选项传给 `Config` 和 `ModelRunner`。Qwen3 的 Attention 和 MLP 投影层分配 INT8 权重矩阵与 FP32 缩放系数，每个输出通道（权重矩阵的一行）一个系数。Embedding、LM Head、归一化、偏置和 KV cache 使用浮点类型。
+2. **加载权重。** `load_model()` 从普通浮点 safetensors 文件读取权重，按模型映射找到目标参数，例如将 `q_proj` 写入 `qkv_proj` 的 Q 段。各并行进程先取自己的分片，再由 `LinearBase._copy_weight()` 调用 `quantize_weight()`，把整数和系数写到对应的位置。行并行会切输入维，因此每个进程按本地的行片段求系数，前向后再把各进程的部分输出相加。
+3. **前向计算。** `LinearBase._linear()` 调用 `int8_linear()`。CUDA 上，Triton 每次只读入一小块 INT8 权重，乘回各行的系数并转成与激活相同的类型，随后与激活做矩阵乘法，用 FP32 累加并写回 FP16/BF16 输出。GPU 因此无需另外保存一份完整的浮点权重。CPU 参考路径会先还原整个矩阵，再交给 `F.linear()`。
+
+### 一行权重怎么算
+
+假设某个输出通道的浮点权重为 `[0.5, -1.0]`，偏置为 0。最大绝对值是 1，所以系数是 `1 / 127`。除以系数后，四舍五入并限制在 `[-127, 127]`，存下的整数为 `[64, -127]`。全零行的系数取 1，量化后仍为全零。
+
+当输入激活为 `[2, 1]` 时，整数权重乘回系数，得到约 `[0.504, -1]`，所以这一通道的输出约为 `2 × 0.504 - 1 ≈ 0.008`。原始浮点权重的结果是 0。这点差值来自量化取整，实际计算还受 16 位浮点舍入影响。
+
+如果扩展到 W8A8，一种做法是在每次前向时为每个输入 token 的激活向量求一个系数，再将激活转成 INT8。用上面的输入，激活系数是 `2/127`，整数激活是 `[127, 64]`。整数点积用 INT32 累加，得到 `127 × 64 + 64 × (-127) = 0`。再乘激活系数和权重系数，加上浮点偏置，得到该输出通道的值。这个例子恰好抵消，W8A8 的误差通常同时来自权重和激活的取整。要接入当前代码，还需新增量化模式和接受 INT8 激活的矩阵乘法路径。
+
+源码见 [配置](nanovllm/config.py)、[模型执行器](nanovllm/engine/model_runner.py)、[Qwen3](nanovllm/models/qwen3.py)、[权重加载](nanovllm/utils/loader.py)、[线性层](nanovllm/layers/linear.py)、[量化公式和 CPU 参考路径](nanovllm/layers/quantization.py)及 [Triton 前向](nanovllm/layers/quantization_triton.py)。
+
+## OpenAI 兼容 API 服务
+
+启动时指定本地模型目录。加上 `--quantization int8` 就会用上面讲的量化模型处理所有请求。
+
+```text
+python -m nanovllm.server --model /YOUR/MODEL/PATH --served-model-name nano-vllm --quantization int8
+```
+
+1. **启动。** CLI 调用 `create_app()`，用单个 Uvicorn worker 提供 HTTP 服务。FastAPI 启动时创建 `AsyncLLMEngine`，后者用一个后台线程初始化并独占同步推理引擎。HTTP 可以同时接收多个请求，引擎把它们交给同一个调度器组批。
+2. **接收。** `POST /v1/completions` 接收 `prompt`，`POST /v1/chat/completions` 接收 `messages`。请求模型校验参数，`respond()` 核对模型名，并把生成选项转成 `SamplingParams`。例如 `temperature=0` 会映射为 `top_k=1` 的贪心选择。聊天消息通过 tokenizer 的聊天模板转成 token，再调用 `LLMEngine.add_request()` 入队。
+3. **推理。** 后台循环调用 `step(stream=True)`，按 `seq_id` 把累计解码后的事件送入各自的有界队列。某个客户端断开，或者消费过慢导致队列满时，服务可以取消该请求，释放它占用的 KV 缓存块。
+4. **返回。** 普通请求等到结束，返回包含 `choices` 和 `usage` 的 JSON。流式请求逐帧返回 SSE，聊天文本增量放在 `choices[0].delta.content`，文本补全的增量放在 `choices[0].text`。正常结束时发送 `[DONE]`，请求了流式用量统计时会先发用量帧。服务还提供 `GET /v1/models` 和 `GET /health`。兼容范围是单候选文本补全和聊天补全，额外字段会受请求模型校验。
+
+### 用一次聊天请求串起来
+
+向 `/v1/chat/completions` 提交这份 JSON。
+
+```json
+{"model":"nano-vllm","messages":[{"role":"user","content":"打个招呼"}],"max_tokens":2,"temperature":0,"stream":true}
+```
+
+后台把聊天模板生成的 token 交给调度器。模型执行到 Attention 或 MLP 的量化投影时，用 16 位激活和逐块解量化的权重计算。假设两轮分别生成「你」「好」，HTTP 客户端先收到角色帧，随后收到这两个文本增量。第二个增量带上 `finish_reason="length"`，因为到达两枚 token 的上限。若把 `stream` 改为 `false`，一次返回的聊天结果里 `choices[0].message.content` 是「你好」。这里的输出是假设，实际由模型决定。
+
+源码见 [启动入口](nanovllm/server/__main__.py)、[请求模型](nanovllm/server/schemas.py)、[HTTP 路由和响应](nanovllm/server/app.py)、[后台调度](nanovllm/server/async_engine.py)和 [推理引擎](nanovllm/engine/llm_engine.py)。SSE 逐帧过程也可以对照本文开头的流式输出章节。
