@@ -741,3 +741,13 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 核心流程：`图片→E视觉特征→P语言KV→D文本输出`。例如256视觉位置加20文本位置，不能只按20个文本token算预算；缓存命中还需图片内容与预处理信息。分别解释E/P特征交接、P/D状态交接、KV量化/淘汰、视觉token压缩和encoder复用，补充多模态质量/分阶段时延评测。
 
 验证：核对本地schemas、engine和官方vLLM EPD文档、Nixl兼容矩阵、Qwen3-VL配置；文档本地链接与git diff检查。没有实现或运行VLM、PD或性能基准；小dense VLM仅候选，不变更最终MoE目标。提交标题：`docs: explain multimodal PD and cache optimization feasibility`；目标分支origin/main。
+
+## 2026-11-18：更新模型解耦设计与基础在线评测
+
+背景：用户将目标调整为文本/多模态模型可选、PD分离、KV Cache量化评估和性能对照。
+
+修改设计报告第14节，明确适配器/引擎边界、先文本回归再VLM→PD→KV量化的顺序。新增 `benchmarks/serve.py` 与 `benchmarks/compare.py`，按JSONL向OpenAI兼容服务发出流式请求，记录逐请求错误、首个文本chunk、总耗时、服务端usage，并对相同工作负载计算吞吐与延迟变化。例如基线100ms、候选80ms时，延迟下降20%；SSE事件不是token，因此只使用服务端usage计token。
+
+测试：`tests/test_benchmarks.py`覆盖流式角色帧与usage、不同工作负载拒绝对比和指标方向。实际验证结果见本次提交记录；本机未进行GPU评测，未实现多模态、PD或KV量化，第一版脚本不覆盖显存/质量/精确ITL，不能宣称性能提升。提交标题：`feat: add initial streaming benchmark and revise design`；目标分支origin/main。
+
+实际运行：新增评测测试4 passed；完整套件110 passed、11 skipped、2 failed（`test_independent_drafter_crops_rejected_suffix_and_releases_state[cpu]` 与 `test_independent_draft_rejection_uses_sampler_filtered_q`，验证环境Transformers DynamicCache.crop不接受现有代码传入的正数），CUDA跳过。完整套件发生在新增第4个测试之前；后续对评测代码的改动仅重新运行评测测试。完整脚本及功能仍未完成，以上不属于性能实测。
