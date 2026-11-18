@@ -750,4 +750,4 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 
 测试：`tests/test_benchmarks.py`覆盖流式角色帧与usage、不同工作负载拒绝对比和指标方向。实际验证结果见本次提交记录；本机未进行GPU评测，未实现多模态、PD或KV量化，第一版脚本不覆盖显存/质量/精确ITL，不能宣称性能提升。提交标题：`feat: add initial streaming benchmark and revise design`；目标分支origin/main。
 
-实际运行：新增评测测试4 passed；完整套件110 passed、11 skipped、2 failed（`test_independent_drafter_crops_rejected_suffix_and_releases_state[cpu]` 与 `test_independent_draft_rejection_uses_sampler_filtered_q`，验证环境Transformers DynamicCache.crop不接受现有代码传入的正数），CUDA跳过。完整套件发生在新增第4个测试之前；后续对评测代码的改动仅重新运行评测测试。完整脚本及功能仍未完成，以上不属于性能实测。
+实际运行：新增评测测试4 passed；完整套件110 passed、11 skipped、2 failed（`test_independent_drafter_crops_rejected_suffix_and_releases_state[cpu]` 与 `test_native_target_speculation_matches_greedy_reference_and_streams[draft_model]`，验证环境Transformers DynamicCache.crop不接受现有代码传入的正数），CUDA跳过。完整套件发生在新增第4个测试之前；后续对评测代码的改动仅重新运行评测测试。完整脚本及功能仍未完成，以上不属于性能实测。
