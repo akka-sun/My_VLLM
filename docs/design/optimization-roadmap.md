@@ -161,3 +161,15 @@ S0先使用人工可核对的SSE样例验证时序、空chunk、多token、错�
 - [vLLM PD设计与Connector](https://docs.vllm.ai/en/latest/features/disagg_prefill/)：分离实例、缓存交接、TTFT/ITL独立优化；不保证吞吐收益。
 - [vLLM量化KV Cache](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/)：量化格式、scale及后端约束的参考。
 - [Transformers Qwen3.5](https://huggingface.co/docs/transformers/main/en/model_doc/qwen3_5)：混合层与模型状态适配参考；不据此承诺所有变体兼容。
+
+## 11. KV压缩路线调整：优先评估KVzap
+
+用户提出使用KVzap。S2调整为优先开展KVzap剪枝的适配验证，FP8/INT8保留为独立后续组合项，不默认同时开启。技术评估见根目录explain.md的“KVzap与当前框架的适配”。这是方案评估，不表示已有可用后端。
+
+新增S2a：Qwen3-8B+匹配官方评分器，在Transformers/kvpress冻结revision建立质量与策略参考，区分KVzapPress固定比例与DMS阈值路径；先整段prefill剪枝，暂不启用decode剪枝。S2b：实现原始位置/逻辑长度/保留长度分离、分层/head索引和物理compact，单请求对照后扩展批处理。S2c：实现chunked/mixed的稀疏历史因果mask、多请求生命周期、TP head映射及压缩PD状态传输。每一项独立验收。
+
+近期窗口保护、阈值和实际保留率按官方参考固定；例示8K输入保留约4K或2K仅代表目标预算实验，不保证阈值法精确达到该长度。KVzap评分器需匹配目标checkpoint，0.6B或Qwen3.5无匹配权重时不得直接复用8B评分器。首版可使用官方linear评分器降低工程复杂度，但linear与MLP必须分别记录质量和成本。
+
+现有FP8的40%占用下降等目标不直接沿用为KVzap既定收益。KVzap测完整保留、约2x、约4x的实际保留率/质量曲线，计入评分器、head索引、临时副本和碎片，使用真实回收页/有效bytes/token判断内存收益。先验证质量门禁，再比较评分/搬运额外成本、TTFT、decode延迟、吞吐和PD载荷。禁止用masked比例替代实际物理压缩率，禁止将论文2–4x结果写成本项目性能。
+
+PD协议需额外传递每层/head原始位置、保留长度、有效页/索引、评分器版本及窗口状态；递归层暂不剪枝。实现复杂度高于同形状KV数值量化，S3依赖S2c完成；如果只是先做系统PD，可先用未剪枝KV验收再接KVzap。压缩路径初期禁用prefix复用、推测解码和graph，分别补足恢复/回滚/地址稳定性测试再开启。

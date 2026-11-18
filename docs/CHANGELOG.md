@@ -715,3 +715,13 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 验证：已核对当前代码入口、远端新增推测解码、官方vLLM与Transformers资料；设计经独立builder check，补入4090通信与FP8后端前置探测。执行文档结构、相对链接与git diff检查；没有运行GPU基准、没有性能实测，所有阈值为拟定验收目标。文档改动不运行推理回归测试。
 
 提交标题：`docs: design four-GPU optimization and benchmark roadmap`；目标分支：`origin/main`。
+
+## 2026-11-18：KVzap适配评估与设计路线调整
+
+背景：用户希望KV压缩采用KVzap，询问与本框架兼容性。
+
+文件：`explain.md`新增KVzap评分→淘汰→紧凑存储→decode的适配分析；`docs/design/optimization-roadmap.md`新增KVzap优先评估路线，保留FP8作为独立组合选项。代表约定：`logical_position != retained_kv_length`。例如保留位置[0,3,6,7]后，新token位置仍为8而不是4，现有共享block_table/context_lens需调整。
+
+已核对官方KVzapPress、ScorerPress、DMSPress及BasePress源码和本项目Qwen3/Attention/BlockManager/ModelRunner。明确官方hook不能直接接入，按head淘汰需要新布局，掩码不等于物理页释放，评分器需匹配checkpoint。验证为静态源码与文档链接/差异检查；未安装或运行KVzap、未验证4090吞吐/质量，不声称已适配或提速。
+
+提交标题：`docs: assess KVzap compatibility and revise cache roadmap`；目标分支：`origin/main`。

@@ -609,3 +609,21 @@ python -m nanovllm.server --model /YOUR/MODEL/PATH --served-model-name nano-vllm
 后台把聊天模板生成的 token 交给调度器。模型执行到 Attention 或 MLP 的量化投影时，用 16 位激活和逐块解量化的权重计算。假设两轮分别生成「你」「好」，HTTP 客户端先收到角色帧，随后收到这两个文本增量。第二个增量带上 `finish_reason="length"`，因为到达两枚 token 的上限。若把 `stream` 改为 `false`，一次返回的聊天结果里 `choices[0].message.content` 是「你好」。这里的输出是假设，实际由模型决定。
 
 源码见 [启动入口](nanovllm/server/__main__.py)、[请求模型](nanovllm/server/schemas.py)、[HTTP 路由和响应](nanovllm/server/app.py)、[后台调度](nanovllm/server/async_engine.py)和 [推理引擎](nanovllm/engine/llm_engine.py)。SSE 逐帧过程也可以对照本文开头的流式输出章节。
+
+## KVzap 与当前框架的适配
+
+2026-11-18，基于NVIDIA kvpress公开实现的静态分析，未运行KVzap。
+
+KVzap是KV剪枝：对每层attention输入hidden states应用训练好的linear/MLP打分器，预测各KV head、各token的重要性。它与FP8/INT8数值量化不同，前者减少保留KV对数量，后者减少每个元素位宽。官方KVzapPress通常配合DMSPress，以阈值淘汰低分项并保护近期窗口；也能使用ScorerPress的固定比例top-k路径，两者不能混称同一策略。
+
+当前调用链是 `Qwen3DecoderLayer → Qwen3Attention → Attention.forward → store_kvcache → FlashAttention`。可在Qwen3Attention接收的归一化hidden states处增加每层打分器，但必须核对官方特征定义、层序和head映射，不能把Q/K或残差直接当作训练输入。官方BasePress依赖Transformers模块hook、past_key_values和cache_position；这里是自定义Context、slot_mapping与GPU分页池，不能直接套 `with press(model)`。
+
+例：原token位置为0至7，某层head0保留[0,3,6,7]，head1保留[1,2,6,7]。两者有效KV长度和位置集合不同；下一token的RoPE位置仍为8，不是4。现有 `Sequence.block_table` 供所有层/head共用，`prepare_decode` 直接将完整序列长度用作context_lens，无法描述这个状态。需要拆开逻辑计算进度、原始位置和各层/head的物理保留长度。Chunked Prefill还须处理稀疏历史加当前chunk的因果可见性，不能继续假定query总与完整连续KV后缀一一对应。
+
+适配需修改：[模型](nanovllm/models/qwen3.py)的特征/评分入口，[缓存管理](nanovllm/engine/block_manager.py)的分层/head布局和回收，[执行器](nanovllm/engine/model_runner.py)的长度/页表/写入映射，[Attention](nanovllm/layers/attention.py)的稀疏历史访问及[Context](nanovllm/utils/context.py)。按层/head分别压缩可能需要head展开或专用attention kernel；只将不同head的掩码取并集会改变策略，应另命名并测质量，不能声称是原版KVzap。
+
+官方DMSPress源码维护masked_key_indices，单凭掩码计数不能证明释放显存或减少读带宽。生产接入必须物理compact并回收页，记录页碎片、评分器/索引/搬运开销；GPU池预留不一定下降。压缩页不能继续使用原整页prefix hash，首版禁用压缩请求prefix共享、推测回滚及CUDA graph，逐项验证后再开放。
+
+建议先以有匹配官方评分权重的Qwen3-8B做Transformers参照，完成单请求整段prefill→压缩→decode，再移植到本框架并扩展多请求、chunked prefill和PD。Qwen3-0.6B/Qwen3.5等不能套用8B评分器；需要匹配训练权重或训练/验证新评分器。混合架构的递归状态也不是可直接套用KVzap的KV对。
+
+参考：[KVzap源码](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/kvzap_press.py)、[DMSPress源码](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/dms_press.py)、[ScorerPress源码](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/scorer_press.py)、[论文](https://arxiv.org/abs/2601.07891)。论文结果不等于本框架实测收益。
