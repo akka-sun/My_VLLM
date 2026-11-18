@@ -641,3 +641,21 @@ vLLM的prefix缓存LRU回收、请求抢占重算、KV offload均不等于对活
 推荐把KVzap从默认首选调整为可选研究项：最终MoE若无匹配评分器，不直接复用dense 8B评分器。先建立完整MoE参考推理，再按块淘汰研究、训练免评分器基线与质量门禁推进；新架构与淘汰不要同一实验一起切换。
 
 参考：[MoE模型支持表](https://docs.vllm.ai/en/latest/models/supported_models/)、[Qwen3.5-MoE配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)、[PagedEviction论文](https://arxiv.org/html/2509.04377v1)、[主线功能请求状态](https://github.com/vllm-project/vllm/issues/38279)、[KV-Compress实现及限制](https://github.com/IsaacRe/vllm-kvcompress)。以上是静态选型分析，未运行MoE或淘汰性能测试。
+
+## 多模态模型、PD与KV优化的关系
+
+2026-11-18：适配可行性分析，不表示已实现。当前 `Message.content` 仅接受str，`LLMEngine`使用AutoTokenizer并只接收文本/token IDs，ModelRunner直接构造文本Qwen3；尚无图像processor、vision encoder、融合模块或多维位置处理。不是更换checkpoint就能推理图片。
+
+以图像输入、文本输出的decoder式VLM为首版范围：图片→processor/patch/grid→vision encoder与merger（可能还含多层视觉特征注入）→视觉embedding与文本组成序列→语言模型prefill→decode文本。假设图像最终展开为256个视觉位置、文本20个位置，则语言侧prefill需要处理约276个位置，实际还含模板和特殊token。图像内容虽不是普通词表token，其对语言层计算的影响也会进入后续状态，不能只按20个文本token分配缓存。Qwen3-VL需遵守模型的M-RoPE和deepstack特征注入，不能只做一次embedding替换。
+
+PD可先采用P同时执行视觉编码和语言prefill、D继续生成的两阶段方案。P交接语言KV、原始位置/M-RoPE增量、展开后序列与长度、采样/模型相关状态；按架构需要交接cross-attention memory或混合递归状态。对于视觉信息已完整融入prefill状态的纯decoder VLM，后续文本decode通常无需重跑vision encoder；具体是否仍有视觉侧依赖须按模型代码验证。更进一步是E(encoder)→P→D：E/P之间传视觉特征与grid等元数据，P/D之间传KV及生成状态。这两类传输不能混称一种缓存。
+
+现有Scheduler可复用预算/队列思想，但需新增encoder显存与计算预算、占位符展开长度、多模态chunk边界和特征生命周期；prefix key还需图像内容hash、预处理参数、processor/模型版本、位置布局，不能仅用相同image占位符token判定命中。图像取消、失败或完成后释放CPU图像/特征、GPU encoder cache及KV，避免只回收KV造成泄漏。HTTP需要content parts和有界图像输入处理，不能在现有str字段塞图片字符串来冒充支持。
+
+KV优化分四类：①语言KV数值量化，需实际后端支持并测OCR等质量；②语言KV淘汰，对视觉和文本位置的影响分别评估；③视觉token合并/筛选，作用于进入语言模型前的特征，属于另一条有损路径；④encoder输出复用，可减少重复图片编码，但不是KV淘汰。视觉位置可能承载小字或空间关系，文本专用KVzap评分器不能直接用于VLM；保留所有视觉KV、仅淘汰文本位置可作保守基线，但必须有位置标记且仍需测质量，图像占主导时压缩收益有限。
+
+新增评测应固定图片分辨率、patch/视觉token数、张数和输出长度；分别计预处理、encoder、语言prefill、传输和decode耗时，记录视觉特征与KV峰值。质量按OCR、图表、空间关系、VQA任务分别验证，不能只用文本PPL。不同请求可跨卡E/P/D重叠，同一请求仍受阶段依赖约束。
+
+首个开发候选可用Qwen3-VL-2B/4B的图像理解路径（dense，不是MoE），先验证多模态基础设施，再接已选MoE VLM；用户尚未授权将最终模型切换为该候选。不同时实现视频/音频输入或图像/音频生成。vLLM已有E→PD及E→P→D示例，但其Nixl矩阵多模态仍存在未验证项，不代表全部模型/后端/PD组合保证兼容。
+
+参考：[vLLM Encoder分离](https://docs.vllm.ai/en/latest/features/disagg_encoder/)、[Nixl兼容矩阵](https://docs.vllm.ai/en/latest/features/nixl_connector_compatibility/)、[Qwen3-VL-2B配置](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/blob/main/config.json)。

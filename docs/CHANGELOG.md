@@ -733,3 +733,11 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 修改 `explain.md` 与 `docs/design/optimization-roadmap.md`：新增MoE/attention类型区分、PagedEviction和KV-Compress支持级别、四4090权重副本容量门禁。代表关系：`MoE FFN ≠ KV attention type`。例如35B BF16单副本仅权重约70GB，P/D双副本约140GB，不能用3B激活量估算显存。PagedEviction研究优先于无匹配评分器的KVzap，明确非已验证实现。
 
 验证：核对官方MoE配置、vLLM支持表、PagedEviction论文/feature状态与KV-Compress README；执行Markdown本地链接与差异检查。未执行模型推理或性能测试，未承诺主线即用或实测加速。提交标题：`docs: prioritize MoE targets and evaluate paged KV eviction`；目标分支：`origin/main`。
+
+## 2026-11-18：多模态PD与KV优化可行性
+
+背景：用户询问框架能否适配多模态及复用PD/KV优化。更新explain.md和设计报告，说明当前API仅str、无processor/vision模块的实际缺口。
+
+核心流程：`图片→E视觉特征→P语言KV→D文本输出`。例如256视觉位置加20文本位置，不能只按20个文本token算预算；缓存命中还需图片内容与预处理信息。分别解释E/P特征交接、P/D状态交接、KV量化/淘汰、视觉token压缩和encoder复用，补充多模态质量/分阶段时延评测。
+
+验证：核对本地schemas、engine和官方vLLM EPD文档、Nixl兼容矩阵、Qwen3-VL配置；文档本地链接与git diff检查。没有实现或运行VLM、PD或性能基准；小dense VLM仅候选，不变更最终MoE目标。提交标题：`docs: explain multimodal PD and cache optimization feasibility`；目标分支origin/main。
