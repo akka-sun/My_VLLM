@@ -627,3 +627,17 @@ KVzap是KV剪枝：对每层attention输入hidden states应用训练好的linear
 建议先以有匹配官方评分权重的Qwen3-8B做Transformers参照，完成单请求整段prefill→压缩→decode，再移植到本框架并扩展多请求、chunked prefill和PD。Qwen3-0.6B/Qwen3.5等不能套用8B评分器；需要匹配训练权重或训练/验证新评分器。混合架构的递归状态也不是可直接套用KVzap的KV对。
 
 参考：[KVzap源码](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/kvzap_press.py)、[DMSPress源码](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/dms_press.py)、[ScorerPress源码](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/scorer_press.py)、[论文](https://arxiv.org/abs/2601.07891)。论文结果不等于本框架实测收益。
+
+## MoE目标与KV淘汰选型
+
+2026-11-18：用户将最终目标从dense Qwen3-8B调整为较新的MoE模型，具体checkpoint待定。MoE主要替换FFN：attention输出→router选择专家→专家计算→加权汇总；不自动改变KV布局。当前Qwen3MLP是dense的gate/up/down，需新增router、专家权重加载及执行，再处理TP或EP，不能只修改config使其支持MoE。
+
+应按attention类型选淘汰：普通GQA的MoE可研究通用token/page淘汰；MLA保存压缩latent，需专门设计评分与布局；线性/full混合模型只对full-attention历史KV研究淘汰，递归/卷积状态独立管理。例：官方Qwen3.5-35B-A3B配置40层中每4层一个full attention，其余为linear attention，不能宣称KV淘汰对40层均产生相同比例收益。官方支持该模型的vLLM不意味着本项目已经支持。
+
+候选比较：PagedEviction面向paged layout、使用K/V重要性代理并在decode做块级回收，可作为当前BlockManager设计的优先研究参考；论文验证Llama系列，不代表已验证目标MoE。KV-Compress有明确vLLM fork与head级分页实现，但README基于v0.6.0且列明不支持TP、chunked prefill、prefix caching及CUDA graph，不适合直接替换本项目。SnapKV/PyramidKV/H2O/AdaKV可作无专用训练评分器的质量对照，但attention统计提取、分层/head布局、物理回收仍需工程实现。sink+recent可作简单基线，不能保证保留被淘汰的远程事实；模型原生sliding window的精确语义与给full attention强加窗口的有损近似要分开。
+
+vLLM的prefix缓存LRU回收、请求抢占重算、KV offload均不等于对活动请求永久丢弃低重要性token。PagedEviction功能请求#38279已关闭为not planned，旧KV-Compress fork也不是当前主线功能；不提供未经验证的vllm serve淘汰开关。
+
+推荐把KVzap从默认首选调整为可选研究项：最终MoE若无匹配评分器，不直接复用dense 8B评分器。先建立完整MoE参考推理，再按块淘汰研究、训练免评分器基线与质量门禁推进；新架构与淘汰不要同一实验一起切换。
+
+参考：[MoE模型支持表](https://docs.vllm.ai/en/latest/models/supported_models/)、[Qwen3.5-MoE配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)、[PagedEviction论文](https://arxiv.org/html/2509.04377v1)、[主线功能请求状态](https://github.com/vllm-project/vllm/issues/38279)、[KV-Compress实现及限制](https://github.com/IsaacRe/vllm-kvcompress)。以上是静态选型分析，未运行MoE或淘汰性能测试。

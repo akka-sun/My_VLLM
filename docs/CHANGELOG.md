@@ -725,3 +725,11 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 已核对官方KVzapPress、ScorerPress、DMSPress及BasePress源码和本项目Qwen3/Attention/BlockManager/ModelRunner。明确官方hook不能直接接入，按head淘汰需要新布局，掩码不等于物理页释放，评分器需匹配checkpoint。验证为静态源码与文档链接/差异检查；未安装或运行KVzap、未验证4090吞吐/质量，不声称已适配或提速。
 
 提交标题：`docs: assess KVzap compatibility and revise cache roadmap`；目标分支：`origin/main`。
+
+## 2026-11-18：MoE目标与vLLM分页淘汰方案评估
+
+背景：用户不再以dense Qwen3-8B为目标，希望适配较新MoE并寻找vLLM适配较好的KV淘汰方法。
+
+修改 `explain.md` 与 `docs/design/optimization-roadmap.md`：新增MoE/attention类型区分、PagedEviction和KV-Compress支持级别、四4090权重副本容量门禁。代表关系：`MoE FFN ≠ KV attention type`。例如35B BF16单副本仅权重约70GB，P/D双副本约140GB，不能用3B激活量估算显存。PagedEviction研究优先于无匹配评分器的KVzap，明确非已验证实现。
+
+验证：核对官方MoE配置、vLLM支持表、PagedEviction论文/feature状态与KV-Compress README；执行Markdown本地链接与差异检查。未执行模型推理或性能测试，未承诺主线即用或实测加速。提交标题：`docs: prioritize MoE targets and evaluate paged KV eviction`；目标分支：`origin/main`。

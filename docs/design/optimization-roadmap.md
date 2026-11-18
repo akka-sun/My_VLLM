@@ -173,3 +173,15 @@ S0先使用人工可核对的SSE样例验证时序、空chunk、多token、错�
 现有FP8的40%占用下降等目标不直接沿用为KVzap既定收益。KVzap测完整保留、约2x、约4x的实际保留率/质量曲线，计入评分器、head索引、临时副本和碎片，使用真实回收页/有效bytes/token判断内存收益。先验证质量门禁，再比较评分/搬运额外成本、TTFT、decode延迟、吞吐和PD载荷。禁止用masked比例替代实际物理压缩率，禁止将论文2–4x结果写成本项目性能。
 
 PD协议需额外传递每层/head原始位置、保留长度、有效页/索引、评分器版本及窗口状态；递归层暂不剪枝。实现复杂度高于同形状KV数值量化，S3依赖S2c完成；如果只是先做系统PD，可先用未剪枝KV验收再接KVzap。压缩路径初期禁用prefix复用、推测解码和graph，分别补足恢复/回滚/地址稳定性测试再开启。
+
+## 12. 最新目标覆盖：MoE模型优先
+
+用户明确最终目标为较新MoE，不使用dense Qwen3-8B作为最终模型。前述第3节dense候选和第11节Qwen3-8B评分器方案降为可选参考，不再约束最终实现；最终HF checkpoint/revision待用户指定。Qwen3.5-35B-A3B文本路径仅为候选。S1扩充模型能力和专家布局合同，先验证router、top-k专家、权重加载、MoE算子与TP/EP策略；S4完成目标MoE的attention/递归状态和推理对齐。EP跨卡通信会与PD/TP争用PCIe，首版优先可行的TP切分，不默认引入EP。
+
+KV淘汰路线调整：S2首先对最终模型的attention类型分类。GQA路径优先研究PagedEviction式块回收，sink+recent为简单有损基线，SnapKV/AdaKV类作质量对照；MLA与混合递归层单独处理。KVzap作为有匹配评分器时的候选，不再默认优先。采用论文思路但聚合层/head评分以适配共享页表时，必须命名为变体，不能当作原论文复现。PagedEviction公开论文在Llama上验证，未证明目标MoE质量；参考vLLM内核免修改也不代表本框架FlashAttention路径免修改。
+
+区分支持级别：vLLM模型支持表只证明架构进入支持范围，不能推出“该模型+某淘汰法+PD+量化+TP”组合已支持。KV-Compress有旧vLLM fork但缺TP等关键特性；PagedEviction主线feature请求已关闭not planned，不按即用主线功能规划。prefix缓存LRU与offload不是有损活动token淘汰。
+
+四卡内存门禁：按全量参数而非激活参数估算权重。30B/35B模型BF16仅权重约60/70GB（十进制），一个四卡实例可能可行但仍需计缓存/workspace；P/D两个完整副本约120/140GB，超过四卡约96GB的标称总显存。故此前四TP1、双TP2、1P3D等布局不能直接套用未量化中型MoE。PD需先选可行的权重量化后端/checkpoint（含MoE支持验证），或更小MoE/更多GPU；现有dense W8A16不能直接视为支持MoE专家。4bit理想数据约15/17.5GB每副本，8bit约30/35GB，均另加scale、未量化权重、cache及workspace，不能仅据公式承诺装得下。可优先评估两组TP2的量化PD，与同权重精度的两TP2共置副本对照。四TP1和1P3D仅在单卡实测可装载时保留。
+
+正式阶段顺序细化为：测量/拓扑→目标MoE完整缓存正确性与可行量化布局→淘汰质量及物理页回收→未淘汰PD→淘汰PD组合。淘汰降低未来attention读取不必然减少当前完整prefill峰值；若只在prefill后压缩，仍需能完成未压缩prefill，报告峰值与稳态分别记录。结果继续全部待测。
