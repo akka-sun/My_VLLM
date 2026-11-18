@@ -699,3 +699,19 @@ num_computed_tokens += len(committed_tokens)
 - 完整测试命令 `python -m pytest -q -rs`：113 passed、7 skipped；跳过项为 1 个真实 paged Attention 和 6 个 CUDA 量化测试，原因是本机缺少 Triton/FlashAttention。CUDA Qwen3 SDPA 发出未编译 Flash Attention 的警告，实际使用 PyTorch 可用后端。
 - 环境：Windows，PyTorch 2.3.1+cu118，RTX 3060 Laptop 6GB；临时 PYTHONPATH 提供 Transformers 4.51.3 与 HTTP 测试依赖，未修改全局环境。该 PyTorch 低于项目声明的 >=2.4；实际 Linux NCCL/Triton/FlashAttention 服务、公开训练 DSpark 大权重、端到端速度/接受率均未验证，不宣称性能收益。
 - 提交标题：`feat: add independent draft and DSpark speculative decoding`；目标分支：`origin/main`。文档包含与上游 vLLM 模型/采样接口及 DSpark 论文的参考链接（见 README）。
+
+## 2026-11-18：四卡优化设计与评测方案
+
+背景：用户计划同机4×RTX4090，要求PD分离、较新模型、KV压缩和实用优化，先交付设计报告。
+
+主体文件：`docs/design/optimization-roadmap.md`。关键约定：
+```text
+S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架构 → S5实用优化
+```
+该顺序先固定度量与缓存协议，避免新架构状态和PD交接重复建设。例如Qwen3只传KV，而混合架构还需递归/卷积状态，不能只更换权重名。
+
+评测设计分为工作负载、离线、在线SSE、缓存微基准、质量和配对报告六类脚本合同，尚未创建脚本。四卡对照包含四TP1副本、双TP2副本、TP4、1P3D、2P2D和两组TP2；例如不能用四卡PD对单卡吞吐后归因PD收益。多token SSE与逐token ITL分开，缓存已用和池预留分开，量化质量与性能共同验收。
+
+验证：已核对当前代码入口、远端新增推测解码、官方vLLM与Transformers资料；设计经独立builder check，补入4090通信与FP8后端前置探测。执行文档结构、相对链接与git diff检查；没有运行GPU基准、没有性能实测，所有阈值为拟定验收目标。文档改动不运行推理回归测试。
+
+提交标题：`docs: design four-GPU optimization and benchmark roadmap`；目标分支：`origin/main`。
