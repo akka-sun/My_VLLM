@@ -1,0 +1,10 @@
+# Tested with platform torch==2.8.0+cu128 on CPU; torch is installed separately.
+transformers==4.57.6
+huggingface-hub==0.36.2
+pytest==8.4.2
+httpx==0.28.1
+fastapi==0.165.0
+uvicorn==0.54.0
+openai==2.54.0
+xxhash==4.1.0
+safetensors==0.8.0

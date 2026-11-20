@@ -45,3 +45,10 @@ def test_http_stream_end_to_end():
     assert result['error'] is None
     assert result['completion_tokens'] == 2
     assert result['ttft_ms'] is not None
+
+
+def test_compare_function_rejects_configuration_mismatch():
+    base = {'workload_sha256': 'same', 'configuration': {'model': 'a'}, 'metrics': {}}
+    other = dict(base, configuration={'model': 'b'})
+    with pytest.raises(ValueError, match='configuration'):
+        compare(base, other)

@@ -751,3 +751,15 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 测试：`tests/test_benchmarks.py`覆盖流式角色帧与usage、不同工作负载拒绝对比和指标方向。实际验证结果见本次提交记录；本机未进行GPU评测，未实现多模态、PD或KV量化，第一版脚本不覆盖显存/质量/精确ITL，不能宣称性能提升。提交标题：`feat: add initial streaming benchmark and revise design`；目标分支origin/main。
 
 实际运行：新增评测测试4 passed；完整套件110 passed、11 skipped、2 failed（`test_independent_drafter_crops_rejected_suffix_and_releases_state[cpu]` 与 `test_native_target_speculation_matches_greedy_reference_and_streams[draft_model]`，验证环境Transformers DynamicCache.crop不接受现有代码传入的正数），CUDA跳过。完整套件发生在新增第4个测试之前；后续对评测代码的改动仅重新运行评测测试。完整脚本及功能仍未完成，以上不属于性能实测。
+
+## 2026-11-20：准备 CPU 开发环境、模型和固定评测输入
+
+在 GPU 尚未启动时建立 S0 的开发基础。`scripts/setup_cpu.sh` 复用平台 PyTorch，按 `requirements/cpu.txt` 安装测试和下载依赖。AutoDL 当前使用 Python 3.12、PyTorch 2.8.0+cu128 和 Transformers 4.57.6。后者的 DynamicCache 支持以绝对 token 数裁剪，推测解码仍由现有回归验证。
+
+`scripts/prepare_models.py` 先解析 revision，再按该 SHA 下载权重与 tokenizer。下载结束后检查单文件或索引列出的全部 safetensors 分片，再写入 `preparation.json`。例如 Qwen3-0.6B 用于文本基线，Qwen3-VL-2B-Instruct 用于后续图文适配。模型文件保存在仓库之外。
+
+`benchmarks.workloads.make_workload` 使用局部 `random.Random(seed)`。例如 mixed、20 条、seed 42 会生成 4 条长文本和 16 条短文本，输出可直接交给现有 SSE 压测。`benchmarks.compare.compare` 在入口验证工作负载和已有配置，即使直接从 Python 调用也会拒绝不同模型或并发设置。
+
+验证：评测和准备相关 10 项测试通过，脚本语法、Python 编译和差异检查通过。整套 pytest 曾以 137 退出，按文件试跑时真实 HTTP 流式测试曾遇到未收到 SSE 的情况。GPU 推理、吞吐和显存尚待实测。
+
+提交标题 `feat: prepare CPU development and reproducible workloads`，目标分支 `origin/main`。
