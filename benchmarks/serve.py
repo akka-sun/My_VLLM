@@ -1,6 +1,7 @@
 ﻿"""Measure streaming chat completions against a running HTTP server."""
 import argparse
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -83,11 +84,23 @@ async def run(args):
     items = [json.loads(line) for line in raw.decode('utf-8-sig').splitlines() if line.strip()]
     if not items or args.concurrency < 1 or args.max_tokens < 1:
         raise ValueError('workload, concurrency and max_tokens must be positive')
+    if args.warmup < 0:
+        raise ValueError('warmup must be nonnegative')
+    server_metadata = None
+    if args.server_metadata is not None:
+        server_metadata = json.loads(Path(args.server_metadata).read_text(encoding='utf-8'))
+        if not isinstance(server_metadata, dict):
+            raise ValueError('server metadata must be a JSON object')
     semaphore = asyncio.Semaphore(args.concurrency)
     async with httpx.AsyncClient() as client:
         async def bounded(item):
             async with semaphore:
                 return await run_one(client, args.url, item, args.model, args.max_tokens, args.timeout)
+        for index in range(args.warmup):
+            result = await bounded(items[index % len(items)])
+            if result['error'] is not None:
+                raise RuntimeError(f"warmup request {index + 1} failed: {result['error']}")
+        started_at = datetime.now(timezone.utc).isoformat()
         start = time.perf_counter()
         results = await asyncio.gather(*(bounded(item) for item in items))
         elapsed = time.perf_counter() - start
@@ -102,10 +115,21 @@ async def run(args):
     output.mkdir(parents=True, exist_ok=True)
     (output / 'requests.jsonl').write_text(''.join(json.dumps(x, ensure_ascii=False)+'\n' for x in results), encoding='utf-8')
     report = {'workload_sha256': hashlib.sha256(raw).hexdigest(),
-              'configuration': {'model': args.model, 'concurrency': args.concurrency, 'max_tokens': args.max_tokens},
+              'configuration': {'model': args.model, 'concurrency': args.concurrency,
+                                'max_tokens': args.max_tokens, 'warmup': args.warmup,
+                                'timeout_seconds': args.timeout},
               'environment': {'platform': platform.platform(), 'python': platform.python_version(), 'url': args.url},
               'metrics': metrics}
     (output / 'metrics.json').write_text(json.dumps(report, indent=2, ensure_ascii=False)+'\n', encoding='utf-8')
+    manifest = {
+        'started_at_utc': started_at,
+        'workload_sha256': report['workload_sha256'],
+        'configuration': report['configuration'],
+        'client': report['environment'],
+        'server': server_metadata,
+    }
+    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n',
+                                          encoding='utf-8')
     print(json.dumps(metrics, indent=2))
 
 
@@ -118,6 +142,10 @@ def main():
     parser.add_argument('--concurrency', type=int, default=1)
     parser.add_argument('--max-tokens', type=int, default=128)
     parser.add_argument('--timeout', type=float, default=120)
+    parser.add_argument('--warmup', type=int, default=0,
+                        help='unmeasured sequential requests before timing')
+    parser.add_argument('--server-metadata', type=Path,
+                        help='JSON object with model revision, GPU and server settings')
     asyncio.run(run(parser.parse_args()))
 
 

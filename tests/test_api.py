@@ -279,7 +279,7 @@ def test_real_http_sse_arrives_before_generation_finishes_and_disconnect_cancels
         while not server.started and thread.is_alive() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert server.started
-        with httpx.Client(base_url=f'http://127.0.0.1:{port}', timeout=5) as client:
+        with httpx.Client(base_url=f'http://127.0.0.1:{port}', timeout=5, trust_env=False) as client:
             with client.stream('POST', '/v1/completions', json={'model':'tiny','prompt':'a','max_tokens':16,'stream':True}) as response:
                 first = next(line for line in response.iter_lines() if line.startswith('data: '))
                 assert json.loads(first[6:])['choices'][0]['text'] == 'A'

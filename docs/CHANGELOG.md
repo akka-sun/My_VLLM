@@ -763,3 +763,15 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 验证：评测和准备相关 10 项测试通过，脚本语法、Python 编译和差异检查通过。整套 pytest 曾以 137 退出，按文件试跑时真实 HTTP 流式测试曾遇到未收到 SSE 的情况。GPU 推理、吞吐和显存尚待实测。
 
 提交标题 `feat: prepare CPU development and reproducible workloads`，目标分支 `origin/main`。
+
+## 2026-11-20：评测预热、运行清单与低内存 CPU 测试
+
+`benchmarks.serve` 可用 `--warmup 10` 在计时前执行预热。预热取固定负载的前几条请求，遇到失败会停止本次运行。例如预热 2 条再测 1 条，实际发送 3 次，逐请求记录只保留测量的 1 条。冷前缀实验需保持预热为 0 并确认服务缓存状态。
+
+`--server-metadata server.json` 随客户端设置和负载哈希写入 `manifest.json`。例如将 `model_revision` 和 `gpu_count` 写入 server.json 后，可在核对候选和基线时追溯来源。比较器拒绝不同预热或超时设置，旧报告沿用默认值。
+
+`scripts/setup_cpu.sh --cpu-wheels` 在 venv 中安装 PyTorch 2.8.0 和 torchvision 0.23.0 的 CPU wheel。真实 HTTP SSE 测试使用 `trust_env=False` 直连测试启动的回环服务器。AutoDL 默认代理会接管本地地址，导致测试未收到 SSE。
+
+验证：准备和评测 11 项通过，CPU 安装脚本实跑通过，固定负载重复生成逐字节一致。草稿与推测解码集成组为 7 passed、1 skipped，包含此前失败的两项。单进程套件在本容器退出码为 137，随后按模块分组完成全部测试，合计 120 passed、11 skipped。Qwen3-0.6B 的权重 SHA-256 与官方记录一致，safetensors 可读。图文候选下载另有日志。GPU 验证与性能评测仍待运行。
+
+提交标题 `feat: archive warmup runs and stabilize CPU testing`，目标分支 `origin/main`。

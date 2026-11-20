@@ -7,7 +7,14 @@ from pathlib import Path
 def compare(baseline, candidate):
     if baseline.get('workload_sha256') != candidate.get('workload_sha256') or not baseline.get('workload_sha256'):
         raise ValueError('workload hashes must match')
-    if baseline.get('configuration') != candidate.get('configuration'):
+    def settings(report):
+        config = report.get('configuration')
+        if config is None:
+            return None
+        # Older reports used these defaults without storing them.
+        return {'warmup': 0, 'timeout_seconds': 120} | config
+
+    if settings(baseline) != settings(candidate):
         raise ValueError('configuration differs; comparisons are not equivalent')
     result = {}
     for key, direction in [('output_tokens_per_second', 1), ('ttft_p95_ms', -1), ('e2e_p95_ms', -1)]:
