@@ -1,0 +1,25 @@
+{
+  "workload_sha256": "0e6198ef0a8cbf5ed75e53553e21f8958efb31adddeceff356f9f606fee17842",
+  "configuration": {
+    "model": "nano-vllm",
+    "concurrency": 16,
+    "max_tokens": 32,
+    "warmup": 6,
+    "timeout_seconds": 120
+  },
+  "environment": {
+    "platform": "Linux-5.15.0-25-generic-x86_64-with-glibc2.35",
+    "python": "3.12.3",
+    "url": "http://127.0.0.1:8000/v1/chat/completions"
+  },
+  "metrics": {
+    "requests": 40,
+    "successes": 40,
+    "failures": 0,
+    "elapsed_seconds": 4.060130314901471,
+    "requests_per_second": 9.851900529692898,
+    "output_tokens_per_second": 315.26081695017274,
+    "ttft_p95_ms": 636.4927957765758,
+    "e2e_p95_ms": 1733.9856158941984
+  }
+}

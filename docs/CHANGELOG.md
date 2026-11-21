@@ -792,3 +792,11 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 验证：CUDA 环境完整 pytest 134 项通过。单卡请求 TP=2 在加载前如预期被拒绝，真实 TP2/TP4 仍待有卡时实测。图文参考适配器尚未接入原生分页调度，INT8 KV 尚待融合注意力内核和质量评测。
 
 提交标题 `feat: add GPU benchmarks and VLM and KV reference paths`，目标分支 `origin/main`。
+
+## 2026-11-21：建立统一评测结果归档
+
+在仓库根目录新增 `result/`，归档单卡文本基线、优化对照、在线 SSE、CUDA 回归和图文参考结果。保留原始清单、指标及必要的合成负载。在 `AGENTS.md` 记录长期规则。例如文本基线复测追加至原有报告，独立的多卡实验则创建新报告并更新索引。
+
+验证：核对报告链接、归档文件与原始结果逐字节一致，以及工作负载和图像的 SHA-256。此次仅归档，未重新运行性能测试。
+
+提交标题 `docs: archive benchmark results under result`，目标分支 `origin/main`。

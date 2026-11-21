@@ -1,0 +1,55 @@
+{
+  "started_at_utc": "2026-11-21T07:28:46.356192+00:00",
+  "workload_sha256": "0e6198ef0a8cbf5ed75e53553e21f8958efb31adddeceff356f9f606fee17842",
+  "configuration": {
+    "model": "nano-vllm",
+    "concurrency": 32,
+    "max_tokens": 32,
+    "warmup": 6,
+    "timeout_seconds": 120
+  },
+  "client": {
+    "platform": "Linux-5.15.0-25-generic-x86_64-with-glibc2.35",
+    "python": "3.12.3",
+    "url": "http://127.0.0.1:8000/v1/chat/completions"
+  },
+  "server": {
+    "git_sha": "1e2e78363bb6735fa5c035bd958d34d41cd38257",
+    "gpu": [
+      {
+        "logical_device": 0,
+        "name": "NVIDIA GeForce RTX 4090",
+        "uuid": "3d7b093f-3850-9e6d-5404-6fcac1c87e54",
+        "total_memory_bytes": 50866487296
+      }
+    ],
+    "visible_devices": "0",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "torchdynamo_disable": "1",
+    "model": "/root/autodl-tmp/models/Qwen--Qwen3-0.6B",
+    "model_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "mode": "baseline HTTP",
+    "options": {
+      "tensor_parallel_size": 1,
+      "enforce_eager": true,
+      "quantization": null,
+      "long_prefill_token_threshold": 0,
+      "max_num_seqs": 32,
+      "max_num_batched_tokens": 512,
+      "max_model_len": 4096,
+      "gpu_memory_utilization": 0.35
+    },
+    "seed": 42,
+    "requests": 20,
+    "warmup": 8,
+    "repeats": 3,
+    "input_lengths": [
+      128,
+      2048
+    ],
+    "output_tokens": 64,
+    "sampled_vocabulary_size": 151669,
+    "gpu_count": 1
+  }
+}

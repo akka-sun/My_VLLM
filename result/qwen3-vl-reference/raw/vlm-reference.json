@@ -1,0 +1,37 @@
+{
+  "model": "/root/autodl-tmp/models/Qwen--Qwen3-VL-2B-Instruct",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "image_sha256": "38a8d8fa2a5bb331a39dbdb302df74f83b578f378005716580a92a9e0afc397c",
+  "prompt": "What color and shape is the object? Answer briefly.",
+  "input_tokens": 85,
+  "image_grid_thw": [
+    [
+      1,
+      16,
+      16
+    ]
+  ],
+  "runs": [
+    {
+      "text": " red square",
+      "output_tokens": 3,
+      "seconds": 0.06083359010517597,
+      "output_tokens_per_second": 49.31486033971136,
+      "peak_allocated_bytes": 4282122752
+    },
+    {
+      "text": " red square",
+      "output_tokens": 3,
+      "seconds": 0.0599943520501256,
+      "output_tokens_per_second": 50.004707067983404,
+      "peak_allocated_bytes": 4282122752
+    },
+    {
+      "text": " red square",
+      "output_tokens": 3,
+      "seconds": 0.05999292433261871,
+      "output_tokens_per_second": 50.005897084914594,
+      "peak_allocated_bytes": 4282122752
+    }
+  ]
+}
