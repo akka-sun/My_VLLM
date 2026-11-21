@@ -12,6 +12,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    packed_kv_slots: torch.Tensor | None = None
 
 _CONTEXT = Context()
 

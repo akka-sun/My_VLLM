@@ -775,3 +775,20 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 验证：准备和评测 11 项通过，CPU 安装脚本实跑通过，固定负载重复生成逐字节一致。草稿与推测解码集成组为 7 passed、1 skipped，包含此前失败的两项。单进程套件在本容器退出码为 137，随后按模块分组完成全部测试，合计 120 passed、11 skipped。Qwen3-0.6B 的权重 SHA-256 与官方记录一致，safetensors 可读。图文候选下载另有日志。GPU 验证与性能评测仍待运行。
 
 提交标题 `feat: archive warmup runs and stabilize CPU testing`，目标分支 `origin/main`。
+
+## 2026-11-21：单卡文本基线、多卡评测入口与 VLM / KV 量化参考路径
+
+用户要求在单张 GPU 上先测文本基线与优化，并让评测入口可以复用到多卡，再开始图文与 KV Cache 量化。
+
+- `benchmarks/offline.py` 按 `--devices` 选择可见卡，`--tp` 传入引擎的 `tensor_parallel_size`。例如 `--devices 0,1 --tp 2` 使用两个 rank，启动前检查卡数和 attention 头数，生成固定负载并记录每轮哈希、总吞吐和每卡分摊吞吐。在线脚本可针对以 TP 启动的服务压测。
+- `LLMEngine.add_request` 先校验 token 类型和非负性，再用 `max(prompt) >= len(self.tokenizer)` 校验上界。例如 2048 个 token 只查询一次词表大小。现场堆栈显示原实现把这次查询放在逐 token 循环里，导致长输入压测迟迟无法开始推理。
+- `Qwen3VLAdapter` 加载本地 Qwen3-VL 和 processor，用 Transformers SDPA 完成图像到文本。示例红色方块图片得到 `red square`，三轮耗时约 60 ms，峰值分配约 4.28 GB，单样例只用于验证路径。
+- `kv_quantization.py` 存放按 token/头的对称量化与页表映射；`Attention.forward` 按需还原有效历史，用变长 FlashAttention 计算，`ModelRunner.allocate_kv_cache` 单独计入 scale 和工作区。以 head_dim=128 为例，每个 K 或 V 向量从 BF16 256 字节降为 INT8 数据 128 字节加 scale 4 字节。模式为 `int8-reference`，当前组合要求 Eager 和关闭推测解码。
+
+实测单张 RTX 4090（SM 8.9），Qwen3-0.6B revision `c1899de289a04d12100db370d81485cdf75e47ca`，PyTorch 2.8.0+cu128，FlashAttention 2.8.3。离线共 20 个请求，20% 为 2048 token 输入，其余 128 token，固定输出 64 token，8 条预热，3 次重复。各模式统一关闭 TorchDynamo 编译。中位输出 token/s：Eager BF16 499.80，CUDA Graph 865.51，Chunked Prefill 阈值 128 为 508.30，W8A16 为 418.64，INT8 KV 参考为 362.94。W8A16 首轮出现额外耗时，保留原始记录。INT8 KV 的峰值分配包含按预算预分配的池，不能据此推断同容量显存收益。原始结果在工作区外 `runs/qwen3-single-gpu`。
+
+在线 SSE 基线每档固定 40 条混合文本请求，预热 6 条，输出上限 32。并发 1/4/16/32 均 40 成功、0 失败。实际输出吞吐依次为 42.32/144.19/315.26/374.34 token/s，P95 TTFT 为 145.31/171.36/636.49/1290.50 ms。对照负载属于闭环测量。
+
+验证：CUDA 环境完整 pytest 134 项通过。单卡请求 TP=2 在加载前如预期被拒绝，真实 TP2/TP4 仍待有卡时实测。图文参考适配器尚未接入原生分页调度，INT8 KV 尚待融合注意力内核和质量评测。
+
+提交标题 `feat: add GPU benchmarks and VLM and KV reference paths`，目标分支 `origin/main`。

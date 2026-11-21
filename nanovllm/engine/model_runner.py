@@ -139,17 +139,28 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        int8_cache = config.kv_cache_dtype == "int8-reference"
+        element_bytes = head_dim + 4 if int8_cache else head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * element_bytes
+        # Reference attention materializes packed floating tensors for active
+        # histories in a single layer. Reserve their conservative peak.
+        workspace = (config.max_num_seqs * config.max_model_len * num_kv_heads
+                     * (2 * head_dim * 12 + 32)) if int8_cache else 0
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current
-                                        - self.draft_cache_reserve) // block_bytes
+                                        - self.draft_cache_reserve - workspace) // block_bytes
         if config.num_kvcache_blocks <= 0:
             raise ValueError('No memory remains for target KV; reduce max_num_seqs/max_model_len or draft model size')
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        shape = (2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads)
+        self.kv_cache = torch.empty(*shape, head_dim, dtype=torch.int8 if int8_cache else hf_config.dtype)
+        scales = torch.empty(*shape, 1, dtype=torch.float32) if int8_cache else None
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if scales is not None:
+                    module.k_scale = scales[0, layer_id]
+                    module.v_scale = scales[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

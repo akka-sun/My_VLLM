@@ -5,6 +5,7 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.layers.kv_quantization import packed_cache_slots, read_int8_cache, write_int8_cache
 
 
 @triton.jit
@@ -55,10 +56,31 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        if self.k_scale is not None:
+            slots = context.slot_mapping.long()
+            write_int8_cache(k, k_cache, self.k_scale, slots)
+            write_int8_cache(v, v_cache, self.v_scale, slots)
+            if context.block_tables is not None:
+                if context.packed_kv_slots is None:
+                    if not context.is_prefill:
+                        lengths = context.context_lens
+                        context.cu_seqlens_q = torch.arange(q.size(0) + 1, device=q.device, dtype=torch.int32)
+                        context.cu_seqlens_k = torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
+                        context.max_seqlen_q = 1
+                        context.max_seqlen_k = int(lengths.max())
+                    context.packed_kv_slots = packed_cache_slots(
+                        context.block_tables, context.cu_seqlens_k, k_cache.shape[1], int(context.cu_seqlens_k[-1]))
+                slots = context.packed_kv_slots
+                k = read_int8_cache(k_cache, self.k_scale, slots, q.dtype)
+                v = read_int8_cache(v_cache, self.v_scale, slots, q.dtype)
+            return flash_attn_varlen_func(
+                q, k, v, context.cu_seqlens_q, context.cu_seqlens_k,
+                context.max_seqlen_q, context.max_seqlen_k, softmax_scale=self.scale, causal=True)
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:

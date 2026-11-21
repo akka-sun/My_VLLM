@@ -61,6 +61,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     quantization: str | None = None
+    kv_cache_dtype: str = "auto"
     speculative_config: dict | None = None
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -70,6 +71,10 @@ class Config:
     def __post_init__(self):
         validate_scheduler_config(self)
         self.speculative_config = validate_speculative_config(self.speculative_config)
+        if self.kv_cache_dtype not in ("auto", "int8-reference"):
+            raise ValueError("kv_cache_dtype must be 'auto' or 'int8-reference'")
+        if self.kv_cache_dtype == "int8-reference" and (not self.enforce_eager or self.speculative_config):
+            raise ValueError("int8-reference KV requires eager execution without speculative decoding")
         if self.speculative_config:
             if self.tensor_parallel_size != 1:
                 raise ValueError("speculative decoding currently requires tensor_parallel_size=1")

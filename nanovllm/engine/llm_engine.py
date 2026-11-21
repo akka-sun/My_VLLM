@@ -56,7 +56,7 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         if not prompt or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in prompt):
             raise ValueError("prompt must contain non-negative integer token IDs")
-        if hasattr(self.tokenizer, "__len__") and any(t >= len(self.tokenizer) for t in prompt):
+        if hasattr(self.tokenizer, "__len__") and max(prompt) >= len(self.tokenizer):
             raise ValueError("prompt contains an out-of-vocabulary token ID")
         if isinstance(sampling_params.max_tokens, bool) or not isinstance(sampling_params.max_tokens, int) or sampling_params.max_tokens < 1:
             raise ValueError("max_tokens must be a positive integer")

@@ -37,3 +37,41 @@ CPU 测试默认复用平台 PyTorch。内存受限时可运行 `bash scripts/se
 
 
 压测可用 `--warmup 10` 在计时前顺序发送 10 条请求。预热从固定工作负载取样，会改变前缀缓存状态。冷缓存实验可保持默认值 0，并确保服务缓存处在所需状态。`--server-metadata server.json` 可把模型 revision、服务端 commit、GPU 型号与数量、精度及优化开关随客户端参数保存到 `manifest.json`。这些字段来自调用方提供的文件，仍需核对服务端实际部署。
+
+## 单卡与多卡文本基线
+
+在装有 CUDA 版 PyTorch 和 FlashAttention 的环境中运行。同一台主机内按顺序启动各个配置，当前引擎使用固定的 NCCL 端口 2333 和共享内存名称。
+
+```bash
+model=../models/Qwen--Qwen3-0.6B
+python -m benchmarks.offline --model "$model" --devices 0 --tp 1 \
+  --mode baseline --output ../runs/text/tp1-baseline
+python -m benchmarks.offline --model "$model" --devices 0,1 --tp 2 \
+  --mode baseline --output ../runs/text/tp2-baseline
+```
+
+改用 `--devices 0,1,2,3 --tp 4` 测四卡 TP。TP 需整除模型的 attention heads 和 KV heads。使用相同种子及长度配置，核对每轮工作负载哈希。基线使用 Eager 和原权重精度，分别指定 `--mode graph`、`--mode chunked` 或 `--mode w8a16` 做单项对照。默认负载中约 20% 的输入为 2048 token，其余为 128 token，每请求固定输出 64 token。结果包含总输出吞吐及 rank 0 的 PyTorch 峰值分配量，后者包含 KV 池，不能当作所有 GPU 显存总和。
+
+在线评测的 TP 由服务端控制。先启动服务，再从另一个终端用本页的 `benchmarks.serve` 命令发请求：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m nanovllm.server --model "$model" \
+  --tensor-parallel-size 2 --port 8000 --enforce-eager \
+  --max-num-batched-tokens 512 --max-num-seqs 32 --gpu-memory-utilization 0.35
+```
+
+单卡使用 `CUDA_VISIBLE_DEVICES=0` 和 `--tensor-parallel-size 1`。在线客户端在本机有代理时应为环回地址设置 `NO_PROXY=127.0.0.1,localhost`，并在服务端清单中记录卡号、TP 和精度。按总吞吐和每 GPU 吞吐分别报告，TP 扩展结果与同卡数下的优化对照应分开解读。
+
+### KV Cache INT8 参考对照
+
+同一模型和负载下，分别使用 `--mode baseline` 和 `--mode kv-int8-reference`。后者在页内使用 INT8 数据及每 token、每 KV head 一份 FP32 scale，按请求页表还原有效历史，再交给 FlashAttention。缓存数据、scale 和反量化工作区都占显存。这条路径用于比较容量、正确性和代价，当前使用 Eager。服务端对应选项为 `--enforce-eager --kv-cache-dtype int8-reference`。
+
+### Qwen3-VL 图像参考测量
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.vlm \
+  --model ../models/Qwen--Qwen3-VL-2B-Instruct --image example.png \
+  --prompt "What is in this image?" --output ../runs/vlm.json
+```
+
+参考适配器使用 Transformers SDPA，在一张指定的 GPU 上运行。计时从已准备好的模型输入开始，包含视觉编码、生成及输出解码。报告保留图片 SHA-256、展开后的输入长度和图片网格信息。Nano-vLLM 的连续批处理、HTTP 图文入口和 VLM TP 仍待接入。

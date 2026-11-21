@@ -79,3 +79,19 @@ def test_stream_rejects_mismatched_params_before_queuing():
     with pytest.raises(ValueError):
         next(llm.generate_stream([[1], [2]], [SamplingParams()]))
     assert llm.is_finished()
+
+
+def test_prompt_validation_checks_tokenizer_size_once_per_request():
+    class SizedTokenizer(Tokenizer):
+        checks = 0
+
+        def __len__(self):
+            self.checks += 1
+            return 10
+
+    llm = engine()
+    llm.tokenizer = SizedTokenizer()
+    llm.add_request([1, 2, 3], SamplingParams())
+    assert llm.tokenizer.checks == 1
+    with pytest.raises(ValueError, match="out-of-vocabulary"):
+        llm.add_request([1, 10], SamplingParams())
