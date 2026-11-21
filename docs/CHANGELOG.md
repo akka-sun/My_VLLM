@@ -820,3 +820,9 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 CUDA 测试 135 项通过。RTX 4090 单卡同负载、同 192 页，三轮中位吞吐为 BF16 499.27、全 INT8 377.14、选择性 INT8 427.43 token/s，KV 池分别为 5.250、2.707、3.979 GiB。成本和验证限制见 [单卡报告](../result/qwen3-text-single-gpu/README.md)。尚未测任务质量、多卡或融合内核。原文本服务已恢复。
 
 提交标题 `feat: support selective layer KV cache quantization`，目标分支 `origin/main`。
+
+## 2026-11-21：归档 vLLM 单卡 KV Cache FP8 对照
+
+安装独立 vLLM 0.10.2 环境，同卡、同模型、同 Triton 后端比较全 BF16 和 FP8 E4M3 KV。最终配置固定 1536 页、每页 32 token，BF16 权重保持一致。比如混合负载中位吞吐从 1521.99 降到 1293.65 token/s，长输出从 1906.88 降到 1619.59 token/s。逐轮输入哈希、输出数量和日志中的真实缓存容量均已核对。原文本服务已恢复。按用户给定条件，本次未修改 My_VLLM 的量化实现。原始报告、复现脚本及启动限制见 [vLLM 结果](../result/vllm-kv-fp8/README.md)。
+
+提交标题 `docs: record vLLM FP8 KV benchmark`，目标分支 `origin/main`。

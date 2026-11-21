@@ -1,0 +1,55 @@
+INFO 11-21 16:21:56 [__init__.py:216] Automatically detected platform cuda.
+INFO 11-21 16:21:57 [utils.py:328] non-default args: {'dtype': 'bfloat16', 'seed': 42, 'max_model_len': 4096, 'block_size': 32, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.35, 'max_num_batched_tokens': 512, 'max_num_seqs': 32, 'disable_log_stats': True, 'enforce_eager': True, 'num_gpu_blocks_override': 1536, 'model': '/root/autodl-tmp/models/Qwen--Qwen3-0.6B'}
+INFO 11-21 16:22:05 [__init__.py:742] Resolved architecture: Qwen3ForCausalLM
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 11-21 16:22:05 [__init__.py:1815] Using max model len 4096
+INFO 11-21 16:22:06 [scheduler.py:222] Chunked prefill is enabled with max_num_batched_tokens=512.
+INFO 11-21 16:22:06 [__init__.py:3400] Cudagraph is disabled under eager mode
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:06 [core.py:654] Waiting for init message from front-end.
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:06 [core.py:76] Initializing a V1 LLM engine (v0.10.2) with config: model='/root/autodl-tmp/models/Qwen--Qwen3-0.6B', speculative_config=None, tokenizer='/root/autodl-tmp/models/Qwen--Qwen3-0.6B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=4096, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=cuda, decoding_config=DecodingConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_backend=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=42, served_model_name=/root/autodl-tmp/models/Qwen--Qwen3-0.6B, enable_prefix_caching=False, chunked_prefill_enabled=True, use_async_output_proc=True, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":[],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":0,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[W1121 16:22:23.948163865 ProcessGroupNCCL.cpp:981] Warning: TORCH_NCCL_AVOID_RECORD_STREAMS is the default now, this environment variable is thus deprecated. (function operator())
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:23 [parallel_state.py:1165] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+(EngineCore_DP0 pid=9456) WARNING 11-21 16:22:23 [topk_topp_sampler.py:69] FlashInfer is not available. Falling back to the PyTorch-native implementation of top-p & top-k sampling. For the best performance, please install FlashInfer.
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:23 [gpu_model_runner.py:2338] Starting to load model /root/autodl-tmp/models/Qwen--Qwen3-0.6B...
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:23 [gpu_model_runner.py:2370] Loading model from scratch...
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:23 [cuda.py:319] Using Triton backend on V1 engine.
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:23 [triton_attn.py:266] Using vllm unified attention for TritonAttentionImpl
+(EngineCore_DP0 pid=9456)
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+(EngineCore_DP0 pid=9456)
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.95it/s]
+(EngineCore_DP0 pid=9456)
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.95it/s]
+(EngineCore_DP0 pid=9456)
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:24 [default_loader.py:268] Loading weights took 0.29 seconds
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:24 [gpu_model_runner.py:2392] Model loading took 1.1201 GiB and 0.396444 seconds
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:25 [gpu_worker.py:298] Available KV cache memory: 15.20 GiB
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:26 [kv_cache_utils.py:802] Overriding num_gpu_blocks=4448 with num_gpu_blocks_override=1536
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:26 [kv_cache_utils.py:864] GPU KV cache size: 49,152 tokens
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:26 [kv_cache_utils.py:868] Maximum concurrency for 4,096 tokens per request: 12.00x
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:26 [gpu_worker.py:391] Free memory on device (46.93/47.37 GiB) on startup. Desired GPU memory utilization is (0.35, 16.58 GiB). Actual usage is 1.12 GiB for weight, 0.24 GiB for peak activation, 0.02 GiB for non-torch memory, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=16168381337` to fit into requested memory, or `--kv-cache-memory=48752267776` to fully utilize gpu memory. Current kv cache memory in use is 16325667737 bytes.
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:26 [core.py:218] init engine (profile, create kv cache, warmup model) took 1.43 seconds
+(EngineCore_DP0 pid=9456) INFO 11-21 16:22:26 [__init__.py:3400] Cudagraph is disabled under eager mode
+INFO 11-21 16:22:26 [llm.py:295] Supported_tasks: ['generate']
+INFO 11-21 16:22:26 [__init__.py:36] No IOProcessor plugins requested by the model
+(EngineCore_DP0 pid=9456) WARNING 11-21 16:22:26 [cudagraph_dispatcher.py:102] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+mixed {"repeat": -2, "output_tokens": 1280, "seconds": 2.5887430338189006, "tokens_per_second": 494.448457524867, "workload_sha256": "47c8e13eba58ba71b7b7efff061de6aeb800b869b70259b05b6c6c4e2ef088fa"}
+mixed {"repeat": -1, "output_tokens": 1280, "seconds": 0.8316813460551202, "tokens_per_second": 1539.0509911895597, "workload_sha256": "78578dc9f3c12a7a6d3c4aab6f869f15b0eb1c54e98ec822eb057a345d5ca05b"}
+mixed {"repeat": 0, "output_tokens": 1280, "seconds": 0.8341716760769486, "tokens_per_second": 1534.4563196148674, "workload_sha256": "cde4e38f99bc5d477d7266e77a5f1e1ae54b34079e6ef1dca0b1931d22e3b156"}
+mixed {"repeat": 1, "output_tokens": 1280, "seconds": 0.8148374757729471, "tokens_per_second": 1570.865403295061, "workload_sha256": "1c260d913d53997f4581f8a3d2b2fceabdf917bc4b8632e688c139b15f2f80f9"}
+mixed {"repeat": 2, "output_tokens": 1280, "seconds": 0.8765124259516597, "tokens_per_second": 1460.3329765807484, "workload_sha256": "94f9008b3e2a22e58fa630a38f8317be38775dc702bb013d3fd8eab069564b17"}
+mixed {"repeat": 3, "output_tokens": 1280, "seconds": 0.8510796977207065, "tokens_per_second": 1503.9719587107925, "workload_sha256": "f023f9891763abb774b63b47b57f20f7e80f4cc55ac2391554f38e47f2af3a2c"}
+mixed {"repeat": 4, "output_tokens": 1280, "seconds": 0.8410055381245911, "tokens_per_second": 1521.9875993377511, "workload_sha256": "304261183c0bad72933a24380fb2016c670a506dc836eab7928c7b8adbeeabe5"}
+decode-heavy {"repeat": -2, "output_tokens": 5120, "seconds": 3.1940862061455846, "tokens_per_second": 1602.962371569327, "workload_sha256": "fd8491128a472c8e7db3d63478b59d71fa01cb276cd71e733d3805c6e2f3e0c0"}
+decode-heavy {"repeat": -1, "output_tokens": 5120, "seconds": 2.664858204778284, "tokens_per_second": 1921.3029762031874, "workload_sha256": "02d241d83f1fca8487dee50e9504711b7244e9f90edfe294bd0289b895586210"}
+decode-heavy {"repeat": 0, "output_tokens": 5120, "seconds": 2.685010106302798, "tokens_per_second": 1906.8829528728038, "workload_sha256": "9da798aad1567ccb92890905b0829b413b1eb4c36e3f77dada435d088fd48e10"}
+decode-heavy {"repeat": 1, "output_tokens": 5120, "seconds": 2.695758257061243, "tokens_per_second": 1899.280095531089, "workload_sha256": "6895d6ef7c18010e73bc0247502fabeb2ad78f69d8084e86eaf6609036400530"}
+decode-heavy {"repeat": 2, "output_tokens": 5120, "seconds": 2.6681014467030764, "tokens_per_second": 1918.967513895204, "workload_sha256": "ae42712d1fe01a0e75dd8f25b41d5bd5a12c62955d7e8ca5a506af6e9da6bac5"}
+decode-heavy {"repeat": 3, "output_tokens": 5120, "seconds": 2.789573141373694, "tokens_per_second": 1835.4062577038985, "workload_sha256": "97b8d8c2e23e911bf5c3137aea6840edc7b73a376f8f7cab1d0ff9276d0cc2ce"}
+decode-heavy {"repeat": 4, "output_tokens": 5120, "seconds": 2.678130706306547, "tokens_per_second": 1911.781224099056, "workload_sha256": "8ff0b01e2922296dafb9e352999c75767d0a32132f73d3f2f3963217ed382bab"}
