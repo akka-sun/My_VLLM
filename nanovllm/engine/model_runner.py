@@ -139,29 +139,40 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        int8_cache = config.kv_cache_dtype == "int8-reference"
-        element_bytes = head_dim + 4 if int8_cache else head_dim * hf_config.dtype.itemsize
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * element_bytes
-        # Reference attention materializes packed floating tensors for active
-        # histories in a single layer. Reserve their conservative peak.
+        layers = [module for module in self.model.modules()
+                  if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
+        if len(layers) != hf_config.num_hidden_layers:
+            raise ValueError("Attention layer count does not match checkpoint")
+        int8_ids = set()
+        if config.kv_cache_dtype == "int8-reference":
+            int8_ids = set(range(len(layers)) if config.kv_int8_layers is None else config.kv_int8_layers)
+        float_ids = [i for i in range(len(layers)) if i not in int8_ids]
+        vector_bytes = len(float_ids) * head_dim * hf_config.dtype.itemsize + len(int8_ids) * (head_dim + 4)
+        block_bytes = 2 * self.block_size * num_kv_heads * vector_bytes
+        # The temporary floating workspace is reused by successive layers.
         workspace = (config.max_num_seqs * config.max_model_len * num_kv_heads
-                     * (2 * head_dim * 12 + 32)) if int8_cache else 0
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current
-                                        - self.draft_cache_reserve - workspace) // block_bytes
+                     * (2 * head_dim * 12 + 32)) if int8_ids else 0
+        capacity = int(total * config.gpu_memory_utilization - used - peak + current
+                       - self.draft_cache_reserve - workspace) // block_bytes
+        config.num_kvcache_blocks = min(capacity, config.kv_cache_max_blocks or capacity)
         if config.num_kvcache_blocks <= 0:
             raise ValueError('No memory remains for target KV; reduce max_num_seqs/max_model_len or draft model size')
-        shape = (2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads)
-        self.kv_cache = torch.empty(*shape, head_dim, dtype=torch.int8 if int8_cache else hf_config.dtype)
-        scales = torch.empty(*shape, 1, dtype=torch.float32) if int8_cache else None
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                if scales is not None:
-                    module.k_scale = scales[0, layer_id]
-                    module.v_scale = scales[1, layer_id]
-                layer_id += 1
+        self.kv_bytes_per_block = block_bytes
+        self.kv_workspace_budget_bytes = workspace
+        page_shape = (config.num_kvcache_blocks, self.block_size, num_kv_heads)
+        if float_ids:
+            cache = torch.empty(2, len(float_ids), *page_shape, head_dim, dtype=hf_config.dtype)
+            for index, layer_id in enumerate(float_ids):
+                layers[layer_id].k_cache = cache[0, index]
+                layers[layer_id].v_cache = cache[1, index]
+        if int8_ids:
+            cache = torch.empty(2, len(int8_ids), *page_shape, head_dim, dtype=torch.int8)
+            scales = torch.empty(2, len(int8_ids), *page_shape, 1, dtype=torch.float32)
+            for index, layer_id in enumerate(sorted(int8_ids)):
+                layers[layer_id].k_cache = cache[0, index]
+                layers[layer_id].v_cache = cache[1, index]
+                layers[layer_id].k_scale = scales[0, index]
+                layers[layer_id].v_scale = scales[1, index]
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

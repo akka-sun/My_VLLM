@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--max-pending-requests', type=int, default=256)
     parser.add_argument('--quantization', choices=['int8'], default=None)
     parser.add_argument('--kv-cache-dtype', choices=['auto', 'int8-reference'], default='auto')
+    parser.add_argument('--kv-int8-layers', type=int, nargs='+', help='Zero-based INT8 layers; default: all')
     parser.add_argument('--enforce-eager', action='store_true')
     parser.add_argument('--speculative-config', type=json.loads, default=None,
                         help='JSON: method (draft_model/dspark), local model, num_speculative_tokens')
@@ -31,7 +32,7 @@ def main():
         parser.error(f'Install server dependencies with pip install ".[server]": {exc}')
     options = {name:getattr(args, name) for name in (
         'tensor_parallel_size', 'max_model_len', 'max_num_batched_tokens', 'max_num_seqs',
-        'gpu_memory_utilization', 'quantization', 'kv_cache_dtype', 'enforce_eager', 'scheduling_policy',
+        'gpu_memory_utilization', 'quantization', 'kv_cache_dtype', 'kv_int8_layers', 'enforce_eager', 'scheduling_policy',
         'long_prefill_token_threshold', 'long_prefill_token_threshold_adaptive',
         'scheduler_reserve_full_isl', 'speculative_config')}
     app = create_app(args.model, served_model_name=args.served_model_name,

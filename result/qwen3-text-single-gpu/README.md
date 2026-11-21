@@ -24,3 +24,15 @@ W8A16 首轮有额外耗时。INT8 KV 的显存记录包含按预算分配的缓
 | [32](raw/online-c32/metrics.json) | 40/0 | 374.34 | 1290.50 ms | 2669.80 ms |
 
 CUDA 回归 [134 项通过](raw/pytest.txt)。TP2/TP4 效果待多卡实测。
+
+## 2026-11-21 补测：同页数下的选择性 KV 量化
+
+原模型和离线负载保持一致。使用 Eager、禁用 TorchDynamo，固定为 192 页（每页 256 token）。选择性方案对中间 14 层量化，保留首尾各 7 层的 BF16。缓存池统计含 scale，反量化工作区另计。
+
+| 模式 | 中位输出 token/s | KV 池 GiB |
+|---|---:|---:|
+| [全 BF16](raw/2026-11-21-kv-selective/bf16/metrics.json) | 499.27 | 5.250 |
+| [全 INT8](raw/2026-11-21-kv-selective/full-int8/metrics.json) | 377.14 | 2.707 |
+| [14 层 INT8](raw/2026-11-21-kv-selective/selective/metrics.json) | 427.43 | 3.979 |
+
+该对照仅测吞吐和缓存池占用。层敏感性、任务准确率和多卡效果尚待实测。

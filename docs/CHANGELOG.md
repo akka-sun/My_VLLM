@@ -812,3 +812,11 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 验证：`gh --version` 为 2.105.0。压测入口的帮助信息和非法模式检查符合预期，评测及准备测试共 11 项通过。此次未重新运行 GPU 压测。
 
 提交标题 `docs: focus quantization benchmarks on KV cache`，目标分支 `origin/main`。
+
+## 2026-11-21：支持按层选择 KV Cache 量化
+
+新增 `Config.kv_int8_layers`，由 `ModelRunner.allocate_kv_cache` 按层建立原精度池和 INT8 池。两种池共用逻辑页编号，只有 INT8 层走反量化参考路径。例如 Qwen3-0.6B 指定层 7–20 时，中间 14 层量化，首尾各 7 层保留 BF16。服务端与离线工具均可指定层号，离线工具还可用 `kv_cache_max_blocks` 限制页数。
+
+CUDA 测试 135 项通过。RTX 4090 单卡同负载、同 192 页，三轮中位吞吐为 BF16 499.27、全 INT8 377.14、选择性 INT8 427.43 token/s，KV 池分别为 5.250、2.707、3.979 GiB。成本和验证限制见 [单卡报告](../result/qwen3-text-single-gpu/README.md)。尚未测任务质量、多卡或融合内核。原文本服务已恢复。
+
+提交标题 `feat: support selective layer KV cache quantization`，目标分支 `origin/main`。

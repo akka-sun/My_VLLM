@@ -62,6 +62,8 @@ class Config:
     enforce_eager: bool = False
     quantization: str | None = None
     kv_cache_dtype: str = "auto"
+    kv_int8_layers: list[int] | tuple[int, ...] | None = None
+    kv_cache_max_blocks: int | None = None
     speculative_config: dict | None = None
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -89,6 +91,16 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.kv_int8_layers is not None:
+            layers = self.kv_int8_layers
+            if (self.kv_cache_dtype != "int8-reference" or not isinstance(layers, (list, tuple))
+                    or not layers or any(type(i) is not int or not 0 <= i < self.hf_config.num_hidden_layers
+                                         for i in layers) or len(set(layers)) != len(layers)):
+                raise ValueError("kv_int8_layers requires unique zero-based layer IDs in int8-reference mode")
+            self.kv_int8_layers = tuple(sorted(layers))
+        if self.kv_cache_max_blocks is not None and (
+                type(self.kv_cache_max_blocks) is not int or self.kv_cache_max_blocks < 1):
+            raise ValueError("kv_cache_max_blocks must be a positive integer")
         if getattr(self.hf_config, 'dtype', None) is None:
             self.hf_config.dtype = getattr(self.hf_config, 'torch_dtype', None) or torch.float16
         if self.speculative_config and self.hf_config.model_type != "qwen3":

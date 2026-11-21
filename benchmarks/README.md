@@ -87,3 +87,15 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmarks.vlm \
 | `textvqa/` | `lmms-lab-encoder/textvqa` 的完整 validation 分片 | 图像文字理解。使用参考答案计算准确率，记录图片分辨率和展开 token 数。 |
 
 原始数据未转换为当前 SSE 压测脚本所需的 `messages` JSONL。量化质量比较应固定样本、提示词、解码参数和评分方法。
+
+在 `--mode kv-int8-reference` 下可加 `--kv-int8-layers 7 8 … 20`，显式选择要量化的零基层号，未列出的层保留模型原精度。不指定层号时量化全部层。服务端对应 `--enforce-eager --kv-cache-dtype int8-reference --kv-int8-layers`。以下以 Bash 为例，在停止同主机的服务后运行：
+
+```bash
+common=(--model ../models/Qwen--Qwen3-0.6B --requests 20 --repeats 3 --kv-cache-max-blocks 192)
+python -m benchmarks.offline "${common[@]}" --mode baseline --output ../runs/kv/bf16
+python -m benchmarks.offline "${common[@]}" --mode kv-int8-reference --output ../runs/kv/full
+python -m benchmarks.offline "${common[@]}" --mode kv-int8-reference \
+  --kv-int8-layers {7..20} --output ../runs/kv/selective
+```
+
+结果中的 `rank0_kv_pool` 给出实际页数、缓存池字节数和预留工作区。比较同容量时须核对实际页数相同，`--kv-cache-max-blocks` 是上限，显存预算不足时实际页数会更小。吞吐和池容量之外，层选择需要单独验证质量。

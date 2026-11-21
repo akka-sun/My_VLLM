@@ -54,3 +54,20 @@ def test_cuda_int8_decode_reads_ragged_paged_history():
         torch.testing.assert_close(actual, expected, atol=.004, rtol=.004)
     finally:
         reset_context()
+
+
+def test_selective_layers_validate_and_preserve_explicit_order(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import pytest
+    from nanovllm.config import AutoConfig, Config
+
+    monkeypatch.setattr(AutoConfig, 'from_pretrained', lambda _: SimpleNamespace(
+        dtype=torch.bfloat16, max_position_embeddings=4096, num_hidden_layers=4))
+    options = dict(enforce_eager=True, kv_cache_dtype='int8-reference')
+    config = Config(str(tmp_path), kv_int8_layers=[3, 1], **options)
+    assert config.kv_int8_layers == (1, 3)
+    for invalid in ([], [True], [2, 2], [-1], [4]):
+        with pytest.raises(ValueError, match='kv_int8_layers'):
+            Config(str(tmp_path), kv_int8_layers=invalid, **options)
+    with pytest.raises(ValueError, match='kv_int8_layers'):
+        Config(str(tmp_path), kv_int8_layers=[1])

@@ -19,6 +19,8 @@ def main():
     parser.add_argument('--devices', help='CUDA_VISIBLE_DEVICES selection, e.g. 0,1')
     parser.add_argument('--tp', type=int, default=1, help='Tensor parallel size')
     parser.add_argument('--mode', choices=['baseline', 'graph', 'chunked', 'kv-int8-reference'], default='baseline')
+    parser.add_argument('--kv-int8-layers', type=int, nargs='+', help='Zero-based INT8 layers; default: all')
+    parser.add_argument('--kv-cache-max-blocks', type=int, help='Cap pages for equal-capacity comparisons')
     parser.add_argument('--requests', type=int, default=80)
     parser.add_argument('--warmup', type=int, default=8)
     parser.add_argument('--repeats', type=int, default=3)
@@ -35,6 +37,8 @@ def main():
     if not 1 <= args.tp <= 8 or min(args.requests, args.repeats, args.short_input,
                                     args.long_input, args.output_tokens) < 1 or args.warmup < 0:
         parser.error('TP must be in [1, 8], lengths and counts must be positive, and warmup cannot be negative')
+    if args.kv_int8_layers is not None and args.mode != 'kv-int8-reference':
+        parser.error('--kv-int8-layers requires --mode kv-int8-reference')
     if args.devices is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.devices
 
@@ -54,6 +58,7 @@ def main():
         parser.error('input plus output exceeds the configured model context')
     options = dict(tensor_parallel_size=args.tp, enforce_eager=args.mode != 'graph',
                    kv_cache_dtype='int8-reference' if args.mode == 'kv-int8-reference' else 'auto',
+                   kv_int8_layers=args.kv_int8_layers, kv_cache_max_blocks=args.kv_cache_max_blocks,
                    long_prefill_token_threshold=args.prefill_threshold if args.mode == 'chunked' else 0,
                    max_num_seqs=args.max_seqs, max_num_batched_tokens=args.token_budget,
                    max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)
@@ -89,6 +94,11 @@ def main():
     try:
         vocabulary_size = min(hf.vocab_size, len(engine.tokenizer))
         manifest['sampled_vocabulary_size'] = vocabulary_size
+        blocks = engine.config.num_kvcache_blocks
+        bytes_per_block = engine.model_runner.kv_bytes_per_block
+        manifest['rank0_kv_pool'] = {'blocks': blocks, 'bytes_per_block': bytes_per_block,
+                                     'allocated_bytes': blocks * bytes_per_block,
+                                     'reference_workspace_budget_bytes': engine.model_runner.kv_workspace_budget_bytes}
         (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         if args.warmup:
             print(f'Warming up with {args.warmup} requests', file=sys.stderr, flush=True)

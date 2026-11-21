@@ -669,3 +669,9 @@ W8A16 在 `nanovllm/layers/quantization_triton.py` 中压缩线性层权重。�
 INT8 KV 参考实现通过 `write_int8_cache` 求每 token、每头的 absmax，量化后写入页池，另存 FP32 scale。例如 head_dim=128 时，每个 K 或 V 向量从 BF16 的 256 字节改为 132 字节。读取时 `packed_cache_slots` 根据页表定位有效历史，`read_int8_cache` 取数、乘 scale、生成连续 BF16/FP16 临时张量，再交给 FlashAttention。decode 每轮会重复这段工作，重复读取的长历史额外产生 gather、临时张量的写读和同步开销。此路径用于验证容量与行为，端到端还要计算工作区，质量需要单独实测。
 
 vLLM 的权重量化依量化格式、硬件和后端选择专用算子，例如条件满足时可用 Marlin 等面向低位权重的 fused GEMM，也有 W8A8/FP8 路径。权重量化格式与 KV Cache dtype 分开配置。KV 量化在匹配的注意力后端上可直接消费分页低精度 KV 及 scale，减少完整浮点历史的物化。具体后端的支持、数值行为和吞吐需要固定 vLLM 版本与 GPU 后核对，不能从量化位宽推断收益。
+
+### 选择性 KV 量化
+
+选择粒度有几种。 [KIVI](https://arxiv.org/abs/2402.02750) 为最近的残留窗口保留高精度，较早的 KV 分组做 2-bit 量化。 [KVQuant](https://arxiv.org/abs/2401.18079) 则把异常值与主体分开处理，以较高精度保存异常值。两者针对不同的误差来源。
+
+本项目第一版按层选择。 `Config.kv_int8_layers` 接收零基层号，`ModelRunner.allocate_kv_cache` 分配独立的浮点池和 INT8 池，但两组层沿用同一份逻辑页表。例如 `--kv-int8-layers {7..20}` 让 Qwen3-0.6B 的中间 14 层用 INT8，首尾各 7 层继续走原来的浮点分页注意力。量化层仍使用先按页还原、再调用 FlashAttention 的参考路径。选择首尾层只是一种待验证的策略，当前没有质量数据证明这些层更敏感。
