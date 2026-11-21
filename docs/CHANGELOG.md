@@ -800,3 +800,7 @@ S0基线 → S1模型/状态接口 → S2缓存压缩 → S3 PD → S4混合架�
 验证：核对报告链接、归档文件与原始结果逐字节一致，以及工作负载和图像的 SHA-256。此次仅归档，未重新运行性能测试。
 
 提交标题 `docs: archive benchmark results under result`，目标分支 `origin/main`。
+
+## 2026-11-21：补充单卡量化性能解释
+
+根据已有单卡结果，在 `explain.md` 补充 W8A16 的 tile 内反量化、INT8 KV 的分页读取与临时浮点张量，以及和 vLLM 专用权重、注意力后端的区别。例如 head_dim 为 128 时，单个 K 或 V 向量由 256 字节降为 132 字节，额外工作区另计。已核对实现及原始评测归档，未重新运行 GPU 测试或 profiler。提交标题 `docs: explain quantization benchmark results`，目标分支 `origin/main`。

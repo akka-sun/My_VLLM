@@ -659,3 +659,13 @@ KV优化分四类：①语言KV数值量化，需实际后端支持并测OCR等�
 首个开发候选可用Qwen3-VL-2B/4B的图像理解路径（dense，不是MoE），先验证多模态基础设施，再接已选MoE VLM；用户尚未授权将最终模型切换为该候选。不同时实现视频/音频输入或图像/音频生成。vLLM已有E→PD及E→P→D示例，但其Nixl矩阵多模态仍存在未验证项，不代表全部模型/后端/PD组合保证兼容。
 
 参考：[vLLM Encoder分离](https://docs.vllm.ai/en/latest/features/disagg_encoder/)、[Nixl兼容矩阵](https://docs.vllm.ai/en/latest/features/nixl_connector_compatibility/)、[Qwen3-VL-2B配置](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/blob/main/config.json)。
+
+## 单卡量化结果与 vLLM 的区别
+
+2026-11-21 的混合负载下，BF16 Eager 为 499.80 token/s，W8A16 为 418.64，INT8 KV 参考为 362.94。各组统一关闭 TorchDynamo。这组结果说明当前实现和负载下的端到端表现，尚无 profile 能量化各项开销的占比。[原始评测归档](result/qwen3-text-single-gpu/README.md)
+
+W8A16 在 `nanovllm/layers/quantization_triton.py` 中压缩线性层权重。每个 tile 读取 INT8 权重后乘 scale、转回激活 dtype，再执行 `tl.dot`。因此权重读量下降，但乘法仍走浮点路径。长 prompt 的矩阵乘能在多 token 间复用权重，省下的读取成本未必抵过转换和内核效率差异。当前 W8A16 首轮还有额外耗时，需增加按形状预热和 prefill/decode 分段测量才能进一步归因。
+
+INT8 KV 参考实现通过 `write_int8_cache` 求每 token、每头的 absmax，量化后写入页池，另存 FP32 scale。例如 head_dim=128 时，每个 K 或 V 向量从 BF16 的 256 字节改为 132 字节。读取时 `packed_cache_slots` 根据页表定位有效历史，`read_int8_cache` 取数、乘 scale、生成连续 BF16/FP16 临时张量，再交给 FlashAttention。decode 每轮会重复这段工作，重复读取的长历史额外产生 gather、临时张量的写读和同步开销。此路径用于验证容量与行为，端到端还要计算工作区，质量需要单独实测。
+
+vLLM 的权重量化依量化格式、硬件和后端选择专用算子，例如条件满足时可用 Marlin 等面向低位权重的 fused GEMM，也有 W8A8/FP8 路径。权重量化格式与 KV Cache dtype 分开配置。KV 量化在匹配的注意力后端上可直接消费分页低精度 KV 及 scale，减少完整浮点历史的物化。具体后端的支持、数值行为和吞吐需要固定 vLLM 版本与 GPU 后核对，不能从量化位宽推断收益。
