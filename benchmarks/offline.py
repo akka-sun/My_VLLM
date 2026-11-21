@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--devices', help='CUDA_VISIBLE_DEVICES selection, e.g. 0,1')
     parser.add_argument('--tp', type=int, default=1, help='Tensor parallel size')
-    parser.add_argument('--mode', choices=['baseline', 'graph', 'chunked', 'w8a16', 'kv-int8-reference'], default='baseline')
+    parser.add_argument('--mode', choices=['baseline', 'graph', 'chunked', 'kv-int8-reference'], default='baseline')
     parser.add_argument('--requests', type=int, default=80)
     parser.add_argument('--warmup', type=int, default=8)
     parser.add_argument('--repeats', type=int, default=3)
@@ -54,7 +54,6 @@ def main():
         parser.error('input plus output exceeds the configured model context')
     options = dict(tensor_parallel_size=args.tp, enforce_eager=args.mode != 'graph',
                    kv_cache_dtype='int8-reference' if args.mode == 'kv-int8-reference' else 'auto',
-                   quantization='int8' if args.mode == 'w8a16' else None,
                    long_prefill_token_threshold=args.prefill_threshold if args.mode == 'chunked' else 0,
                    max_num_seqs=args.max_seqs, max_num_batched_tokens=args.token_budget,
                    max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)

@@ -50,7 +50,7 @@ python -m benchmarks.offline --model "$model" --devices 0,1 --tp 2 \
   --mode baseline --output ../runs/text/tp2-baseline
 ```
 
-改用 `--devices 0,1,2,3 --tp 4` 测四卡 TP。TP 需整除模型的 attention heads 和 KV heads。使用相同种子及长度配置，核对每轮工作负载哈希。基线使用 Eager 和原权重精度，分别指定 `--mode graph`、`--mode chunked` 或 `--mode w8a16` 做单项对照。默认负载中约 20% 的输入为 2048 token，其余为 128 token，每请求固定输出 64 token。结果包含总输出吞吐及 rank 0 的 PyTorch 峰值分配量，后者包含 KV 池，不能当作所有 GPU 显存总和。
+改用 `--devices 0,1,2,3 --tp 4` 测四卡 TP。TP 需整除模型的 attention heads 和 KV heads。使用相同种子及长度配置，核对每轮工作负载哈希。基线使用 Eager 和原权重精度，分别指定 `--mode graph`或 `--mode chunked` 做单项对照。默认负载中约 20% 的输入为 2048 token，其余为 128 token，每请求固定输出 64 token。结果包含总输出吞吐及 rank 0 的 PyTorch 峰值分配量，后者包含 KV 池，不能当作所有 GPU 显存总和。
 
 在线评测的 TP 由服务端控制。先启动服务，再从另一个终端用本页的 `benchmarks.serve` 命令发请求：
 
@@ -64,7 +64,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m nanovllm.server --model "$model" \
 
 ### KV Cache INT8 参考对照
 
-同一模型和负载下，分别使用 `--mode baseline` 和 `--mode kv-int8-reference`。后者在页内使用 INT8 数据及每 token、每 KV head 一份 FP32 scale，按请求页表还原有效历史，再交给 FlashAttention。缓存数据、scale 和反量化工作区都占显存。这条路径用于比较容量、正确性和代价，当前使用 Eager。服务端对应选项为 `--enforce-eager --kv-cache-dtype int8-reference`。
+后续量化评测仅做 KV Cache 对照，历史 W8A16 结果见 [单卡文本报告](../result/qwen3-text-single-gpu/README.md)。同一模型和负载下，分别使用 `--mode baseline` 和 `--mode kv-int8-reference`。后者在页内使用 INT8 数据及每 token、每 KV head 一份 FP32 scale，按请求页表还原有效历史，再交给 FlashAttention。缓存数据、scale 和反量化工作区都占显存。这条路径用于比较容量、正确性和代价，当前使用 Eager。服务端对应选项为 `--enforce-eager --kv-cache-dtype int8-reference`。
 
 ### Qwen3-VL 图像参考测量
 
@@ -75,3 +75,15 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmarks.vlm \
 ```
 
 参考适配器使用 Transformers SDPA，在一张指定的 GPU 上运行。计时从已准备好的模型输入开始，包含视觉编码、生成及输出解码。报告保留图片 SHA-256、展开后的输入长度和图片网格信息。Nano-vLLM 的连续批处理、HTTP 图文入口和 VLM TP 仍待接入。
+
+## 本地评估数据
+
+数据保存在仓库外的 `../datasets/`，各目录的 `manifest.json` 记录来源、固定 revision、文件大小和 SHA-256。将数据加工为评测输入时，记录切分、抽样种子和样本数，结果写入 `result/`。
+
+| 本地目录 | 来源与范围 | 用途 |
+|---|---|---|
+| `mmlu/` | `cais/mmlu` 的 `all` 配置，包含 dev、validation、test | 多项选择准确率。dev 可作 few-shot 示例。 |
+| `sharegpt/` | `anon8231489123/ShareGPT_Vicuna_unfiltered` 的 `ShareGPT_V3_unfiltered_cleaned_split.json` | 从对话生成服务压测负载。固定筛选规则及输入和输出长度分桶，只保留必要的复现元数据。 |
+| `textvqa/` | `lmms-lab-encoder/textvqa` 的完整 validation 分片 | 图像文字理解。使用参考答案计算准确率，记录图片分辨率和展开 token 数。 |
+
+原始数据未转换为当前 SSE 压测脚本所需的 `messages` JSONL。量化质量比较应固定样本、提示词、解码参数和评分方法。
