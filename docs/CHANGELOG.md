@@ -826,3 +826,9 @@ CUDA 测试 135 项通过。RTX 4090 单卡同负载、同 192 页，三轮中�
 安装独立 vLLM 0.10.2 环境，同卡、同模型、同 Triton 后端比较全 BF16 和 FP8 E4M3 KV。最终配置固定 1536 页、每页 32 token，BF16 权重保持一致。比如混合负载中位吞吐从 1521.99 降到 1293.65 token/s，长输出从 1906.88 降到 1619.59 token/s。逐轮输入哈希、输出数量和日志中的真实缓存容量均已核对。原文本服务已恢复。按用户给定条件，本次未修改 My_VLLM 的量化实现。原始报告、复现脚本及启动限制见 [vLLM 结果](../result/vllm-kv-fp8/README.md)。
 
 提交标题 `docs: record vLLM FP8 KV benchmark`，目标分支 `origin/main`。
+
+## 2026-11-22：ShareGPT 高并发与 KV 容量压力对照
+
+用 vLLM 0.10.2 V1 Triton 在 RTX 4090（24 GiB）上压测 Qwen3-0.6B。以种子 42 固定 256 条 ShareGPT 请求，每条输出 128 token，并发上限 32/64/128。为模拟容量压力，逻辑池从 49,152 缩为 12,288 token，并增加同 KV 数据字节预算的 24,576-token FP8 组。例如并发 128 时，小池 BF16 为 2441.49 token/s、有 128 次抢占。同页数 FP8 为 2188.25 token/s，扩大 FP8 池后为 3591.19 token/s、96 次抢占。缩池产生的是抢占重算，未实现历史 token 淘汰。
+
+验证：15 组均完成 256 条请求，无失败。核对输入和输出 token 数、实际后端与缓存容量、服务端抢占计数差值。原始指标、抽样清单和脚本追加到 [既有 vLLM 报告](../result/vllm-kv-fp8/README.md)，此次未改推理实现。提交标题 `docs: benchmark ShareGPT under KV cache pressure`，目标分支 `origin/main`。

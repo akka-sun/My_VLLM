@@ -1,0 +1,2 @@
+(EngineCore_DP0 pid=3526) INFO 11-22 13:46:17 [cuda.py:319] Using Triton backend on V1 engine.
+(EngineCore_DP0 pid=3526) INFO 11-22 13:46:19 [kv_cache_utils.py:864] GPU KV cache size: 12,288 tokens

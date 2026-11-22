@@ -1,0 +1,3 @@
+vllm:num_preemptions_total{engine="0",model_name="qwen3"} 118.0
+vllm:prompt_tokens_total{engine="0",model_name="qwen3"} 116602.0
+vllm:generation_tokens_total{engine="0",model_name="qwen3"} 65792.0
